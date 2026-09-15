@@ -211,7 +211,21 @@ def mask_secret(value: str, keep_tail: int = 4) -> str:
 # ═════════════════════════════════════════════════════════════════
 
 BASE_DIR = Path(__file__).resolve().parent
-STORAGE_DIR = BASE_DIR / "storage"
+
+# Where the SQLite database, downloads and cookies live.
+#
+# ⚠️ Hosting note (Railway / Render / Heroku): the container filesystem is
+# WIPED on every deploy, which silently deletes bot_data.db — and with it every
+# connected YouTube channel. That is a very common cause of "channels=0" right
+# after a redeploy. Attach a persistent volume and point this at it:
+#     STORAGE_DIR=/data        # volume mounted on /data
+# Railway also exports RAILWAY_VOLUME_MOUNT_PATH, which is picked up below.
+STORAGE_DIR = Path(
+    os.environ.get("STORAGE_DIR")
+    or os.environ.get("DATA_DIR")
+    or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+    or (BASE_DIR / "storage")
+)
 DB_FILE = STORAGE_DIR / "bot_data.db"
 
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -244,13 +258,19 @@ try:
 except (TypeError, ValueError):
     OWNER_ID = 0
 
-# YouTube OAuth
-YT_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "")
-YT_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
-YT_REDIRECT_URI = os.environ.get("YOUTUBE_REDIRECT_URI", "http://localhost:8000/oauth/callback")
+# YouTube OAuth.
+# .strip() is not cosmetic: secrets pasted into Railway / Render / Heroku
+# dashboards very often carry a trailing newline or space. One stray character
+# makes Google answer EVERY token request with 400 invalid_client or
+# redirect_uri_mismatch, which looks exactly like a code problem.
+YT_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "").strip()
+YT_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "").strip()
+YT_REDIRECT_URI = os.environ.get(
+    "YOUTUBE_REDIRECT_URI", "http://localhost:8000/oauth/callback").strip()
 YT_SCOPES = [
-    "https://www.googleapis.com/auth/youtube.upload",
-    "https://www.googleapis.com/auth/youtube",
+    "https://www.googleapis.com/auth/youtube.upload",    # insert videos
+    "https://www.googleapis.com/auth/youtube",           # manage the channel
+    "https://www.googleapis.com/auth/youtube.readonly",  # list channels + stats
 ]
 
 # The HTTP port for the built-in Flask app (keep-alive + OAuth callback).
@@ -372,6 +392,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS youtube_channels
                  (user_id INTEGER, channel_id TEXT, channel_name TEXT,
                   access_token TEXT, refresh_token TEXT, token_expiry TEXT,
+                  status TEXT DEFAULT 'connected', last_error TEXT,
                   PRIMARY KEY (user_id, channel_id))''')
     c.execute('''CREATE TABLE IF NOT EXISTS upload_jobs
                  (job_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
@@ -429,6 +450,8 @@ def init_db():
     _ensure_columns(conn, "youtube_channels", {
         "thumbnail": "TEXT",
         "connected_at": "TEXT",
+        "status": "TEXT DEFAULT 'connected'",
+        "last_error": "TEXT",
     })
 
     if OWNER_ID:
@@ -681,6 +704,58 @@ def default_channel_id(uid: int) -> str:
 
 def set_default_channel(uid: int, channel_id: str) -> None:
     db_query('UPDATE users SET last_channel_id = ? WHERE user_id = ?', (channel_id, uid))
+
+
+def save_channel_tokens(uid: int, tokens: dict, info: Optional[dict] = None) -> dict:
+    """Persist freshly-issued tokens for one user's channel and return its info.
+
+    Shared by BOTH the Flask callback and the manual paste flow so the two can
+    never drift apart. ``info`` may be passed in when the caller already fetched
+    it, saving a second channels.list round-trip.
+    """
+    if not yt_service:
+        raise ValueError("YouTube API not configured")
+    refresh = tokens.get("refresh_token", "") or ""
+    expiry = datetime.utcnow() + timedelta(seconds=int(tokens.get("expires_in", 3600)))
+    access = tokens.get("access_token", "") or ""
+    if info is None:
+        credentials = yt_service.build_credentials(access, refresh, expiry)
+        info = yt_service.get_channel_info(credentials)
+
+    db_query(
+        'INSERT OR REPLACE INTO youtube_channels '
+        '(user_id, channel_id, channel_name, access_token, refresh_token, token_expiry, '
+        'thumbnail, connected_at, status, last_error) '
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'connected', NULL)",
+        (uid, info["channel_id"], info["channel_name"], encrypt_data(access),
+         encrypt_data(refresh) if refresh else "",
+         expiry.isoformat(), info.get("thumbnail", ""), datetime.utcnow().isoformat()))
+    set_default_channel(uid, info["channel_id"])
+    audit(uid, "channel_connected", info["channel_id"])
+    # Never serve a stale access token for this channel again.
+    ACCESS_TOKEN_CACHE[(uid, info["channel_id"])] = (access, expiry)
+    return info
+
+
+def disconnect_channel(uid: int, channel_id: str) -> bool:
+    """Forget one channel: revoke the token at Google, then delete the row."""
+    if not channel_id:
+        return False
+    row = channel_row(uid, channel_id)
+    if not row:
+        return False
+    refresh = decrypt_data(row[3]) if row[3] else ""
+    if refresh and yt_service:
+        # Best effort: the local delete is what actually disconnects the user.
+        yt_service.revoke_token(refresh)
+    db_query('DELETE FROM youtube_channels WHERE user_id = ? AND channel_id = ?',
+             (uid, channel_id))
+    ACCESS_TOKEN_CACHE.pop((uid, channel_id), None)
+    if default_channel_id(uid) == channel_id:
+        remaining = user_channels(uid)
+        set_default_channel(uid, remaining[0][0] if remaining else "")
+    audit(uid, "channel_disconnected", channel_id)
+    return True
 
 
 # ── Upload job helpers ──────────────────────────────────────────────
@@ -1010,6 +1085,48 @@ def scan_file(file_path: str) -> dict:
 #  YOUTUBE SERVICE
 # ═════════════════════════════════════════════════════════════════
 
+# Google OAuth endpoints, kept in one place so the authorization URL and the
+# token exchange can never drift apart.
+TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke"
+
+# A Connect link / authorization state stays valid for this long.
+OAUTH_STATE_TTL_SECONDS = 600
+
+# Short-lived cache of refreshed access tokens: (uid, channel_id) -> (token, expiry).
+# Saves a round-trip to Google on every API call while staying correct after the
+# 1-hour access-token lifetime.
+ACCESS_TOKEN_CACHE: Dict[Tuple[int, str], Tuple[str, datetime]] = {}
+
+
+class OAuthError(Exception):
+    """A failed Google OAuth call, carrying Google's own error code."""
+
+    def __init__(self, error: str, description: str = "", status: int = 0):
+        super().__init__(f"{error}: {description}" if description else error)
+        self.error = error
+        self.description = description
+        self.status = status
+
+
+def extract_auth_code(raw: str) -> str:
+    """Pull a usable authorization code out of a pasted URL (or a bare code).
+
+    Google codes look like ``4/0ATsMZq...``; the ``/`` may arrive percent-encoded
+    as ``%2F``. The value must be decoded EXACTLY ONCE: whatever we hand to
+    requests is re-encoded into the form body, so decoding twice (or not at all)
+    is the classic cause of ``invalid_grant`` / 400 on the token endpoint.
+    """
+    text = (raw or "").strip()
+    match = re.search(r"code=([^&\s]+)", text)
+    if match:
+        # Full callback URL -> take the parameter and percent-decode it once.
+        return unquote(match.group(1))
+    # Not a URL: the user pasted the bare code. Never unquote here, because a
+    # bare code may legitimately contain '+' or '%'.
+    return text
+
+
 class YouTubeService:
     def __init__(self):
         self.client_id = YT_CLIENT_ID
@@ -1034,27 +1151,62 @@ class YouTubeService:
         return url
 
     def exchange_code(self, code: str) -> dict:
-        """Swap an authorization code for an access + refresh token."""
-        resp = req_lib.post("https://oauth2.googleapis.com/token", data={
+        """Swap a one-time authorization code for access + refresh tokens.
+
+        ``code`` must already be percent-decoded (see extract_auth_code()).
+        Google codes are SINGLE USE and expire in ~60 seconds, so a code that a
+        server-side /oauth callback already exchanged returns invalid_grant.
+        """
+        return self._token_request({
             "code": code,
             "client_id": self.client_id,
             "client_secret": self.client_secret,
+            # MUST be byte-for-byte the same redirect_uri that produced the code,
+            # otherwise Google answers redirect_uri_mismatch (HTTP 400).
             "redirect_uri": self.redirect_uri,
             "grant_type": "authorization_code",
         })
-        resp.raise_for_status()
-        return resp.json()
 
     def refresh_access_token(self, refresh_token: str) -> dict:
-        """Get a fresh access token from a stored refresh token."""
-        resp = req_lib.post("https://oauth2.googleapis.com/token", data={
+        """Trade a stored refresh token for a fresh 1-hour access token."""
+        return self._token_request({
             "refresh_token": refresh_token,
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "grant_type": "refresh_token",
         })
-        resp.raise_for_status()
+
+    def _token_request(self, payload: dict) -> dict:
+        """POST to Google's token endpoint, mapping failures to OAuthError."""
+        try:
+            resp = req_lib.post(TOKEN_ENDPOINT, data=payload, timeout=20)
+        except Exception as exc:  # network / DNS / TLS failure
+            print(f"[oauth] token request failed: {exc}")
+            raise OAuthError("network_error", str(exc)) from exc
+
+        if resp.status_code != 200:
+            # Google always answers 400 with a JSON {error, error_description}.
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            err = str(body.get("error") or f"http_{resp.status_code}")
+            desc = str(body.get("error_description") or resp.text[:300])
+            print(f"[oauth] token endpoint {resp.status_code}: {err} - {desc} "
+                  f"(redirect_uri={payload.get('redirect_uri', '-')})")
+            raise OAuthError(err, desc, resp.status_code)
         return resp.json()
+
+    def revoke_token(self, token: str) -> bool:
+        """Best-effort token revoke at Google (used by Disconnect)."""
+        if not token:
+            return False
+        try:
+            resp = req_lib.post(REVOKE_ENDPOINT, data={"token": token}, timeout=15)
+            return resp.status_code == 200
+        except Exception as exc:
+            print(f"[oauth] revoke failed: {exc}")
+            return False
 
     def build_credentials(self, access_token: str, refresh_token: str,
                           expiry: Optional[datetime] = None):
@@ -1069,7 +1221,12 @@ class YouTubeService:
         )
 
     def credentials_for_channel(self, uid: int, channel_id: str):
-        """Load (and refresh when needed) the stored OAuth credentials."""
+        """Load (refreshing when needed) ONE user's OAuth credentials.
+
+        Multi-user model: every Telegram user owns their own row in
+        youtube_channels, so uploads always go to THEIR channel. There is no
+        global refresh token anywhere in this bot.
+        """
         row = channel_row(uid, channel_id)
         if not row:
             raise ValueError("Channel not connected. Use Connect YouTube first.")
@@ -1083,21 +1240,41 @@ class YouTubeService:
             except ValueError:
                 expiry = None
 
-        need_refresh = False
-        if not access:
-            need_refresh = True
-        elif expiry and expiry - timedelta(minutes=3) <= datetime.utcnow():
-            need_refresh = True
+        # 1. Serve a still-valid token straight from the in-memory cache.
+        cached = ACCESS_TOKEN_CACHE.get((uid, channel_id))
+        if cached and cached[1] - timedelta(minutes=3) > datetime.utcnow():
+            return self.build_credentials(cached[0], refresh, cached[1])
+
+        # 2. Use the stored token while it still has >3 minutes left.
+        need_refresh = (not access) or bool(
+            expiry and expiry - timedelta(minutes=3) <= datetime.utcnow())
 
         if need_refresh and refresh:
-            tok = self.refresh_access_token(refresh)
+            # 3. Exchange the refresh token for a fresh 1-hour access token.
+            try:
+                tok = self.refresh_access_token(refresh)
+            except OAuthError as exc:
+                if exc.error in ("invalid_grant", "invalid_client", "unauthorized_client"):
+                    # Google revoked it: the user removed access, or the OAuth app
+                    # is still in "Testing" mode where refresh tokens die after 7
+                    # days. Flag the channel so the UI can ask to reconnect.
+                    db_query('UPDATE youtube_channels SET status = ?, last_error = ? '
+                             'WHERE user_id = ? AND channel_id = ?',
+                             ("revoked", exc.error, uid, channel_id))
+                    raise ValueError(
+                        "YouTube access was revoked or expired. "
+                        "Tap Connect YouTube to link the channel again.") from exc
+                raise ValueError(f"Could not refresh the YouTube token: {exc}") from exc
+
             access = tok.get("access_token", access)
             expires_in = int(tok.get("expires_in", 3600))
             new_expiry = datetime.utcnow() + timedelta(seconds=expires_in)
-            db_query('UPDATE youtube_channels SET access_token = ?, token_expiry = ? '
-                     'WHERE user_id = ? AND channel_id = ?',
-                     (encrypt_data(access), new_expiry.isoformat(), uid, channel_id))
+            db_query('UPDATE youtube_channels SET access_token = ?, token_expiry = ?, '
+                     'status = ?, last_error = NULL WHERE user_id = ? AND channel_id = ?',
+                     (encrypt_data(access), new_expiry.isoformat(), "connected",
+                      uid, channel_id))
             expiry = new_expiry
+            ACCESS_TOKEN_CACHE[(uid, channel_id)] = (access, expiry)
         elif need_refresh and not refresh:
             raise ValueError("Stored token expired and no refresh token - reconnect the channel.")
 
@@ -1788,35 +1965,62 @@ def _handle_oauth_callback(state: str, code: str, error: str = ""):
     if error:
         return page("Connection failed", f"<p>Google returned: <code>{escape(error)}</code></p>")
 
-    row = db_query('SELECT user_id, chat_id FROM oauth_states WHERE state = ?', (state,), fetch=True)
+    row = db_query('SELECT user_id, chat_id, created_at FROM oauth_states WHERE state = ?',
+                   (state,), fetch=True)
     if not row:
         return page("Link expired",
                     "<p>This authorization link was already used or the bot restarted. "
                     "Open the bot and tap <b>Connect YouTube</b> again.</p>")
     uid = int(row[0][0])
+    # States are single-use: burn it before doing anything else so a browser
+    # refresh can never replay the (already consumed) authorization code.
     db_query('DELETE FROM oauth_states WHERE state = ?', (state,))
 
+    # A stale state means the user sat on the Google page too long; Google's code
+    # is dead by now, so say so instead of surfacing a raw Google error.
+    created_at = row[0][2]
+    if created_at:
+        try:
+            age = (datetime.utcnow() - datetime.fromisoformat(created_at)).total_seconds()
+        except ValueError:
+            age = 0.0
+        if age > OAUTH_STATE_TTL_SECONDS:
+            notify(uid, "⌛ That <b>Connect YouTube</b> link expired. Tap it again to retry.")
+            return page("Link expired",
+                        "<p>This authorization link is too old. Return to Telegram and "
+                        "tap <b>Connect YouTube</b> again.</p>")
+
+    if not code:
+        return page("Connection failed",
+                    "<p>Google did not send an authorization code. Try again from Telegram.</p>")
+
     try:
-        tokens = yt_service.exchange_code(code)
-        expiry = datetime.utcnow() + timedelta(seconds=int(tokens.get("expires_in", 3600)))
-        credentials = yt_service.build_credentials(
-            tokens.get("access_token", ""), tokens.get("refresh_token", ""), expiry)
-        info = yt_service.get_channel_info(credentials)
+        # Normalise the code exactly like the manual paste flow does.
+        tokens = yt_service.exchange_code(extract_auth_code(code))
+        info = save_channel_tokens(uid, tokens)
+    except OAuthError as exc:
+        print(f"[oauth] callback exchange failed for uid={uid}: {exc.error} - {exc.description}")
+        hint = ""
+        if exc.error == "invalid_grant":
+            hint = " — the code was already used or has expired. Tap Connect YouTube again."
+        elif exc.error == "redirect_uri_mismatch":
+            hint = f" — add {YT_REDIRECT_URI} to Authorized redirect URIs in Google Cloud."
+        notify(uid, f"❌ YouTube connection failed: <code>{escape(exc.error)}</code>{escape(hint)}")
+        return page("Connection failed",
+                    f"<p><b>{escape(exc.error)}</b>: {escape(exc.description[:300])}"
+                    f"{escape(hint)}</p>")
     except Exception as exc:
         notify(uid, f"❌ YouTube connection failed: <code>{escape(str(exc)[:300])}</code>")
         return page("Connection failed", f"<p>{escape(str(exc)[:400])}</p>")
 
-    access = tokens.get("access_token", "")
-    refresh = tokens.get("refresh_token", "")
-    db_query(
-        'INSERT OR REPLACE INTO youtube_channels '
-        '(user_id, channel_id, channel_name, access_token, refresh_token, token_expiry, '
-        'thumbnail, connected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        (uid, info["channel_id"], info["channel_name"], encrypt_data(access),
-         encrypt_data(refresh) if refresh else "", expiry.isoformat(),
-         info.get("thumbnail", ""), datetime.utcnow().isoformat()))
-    set_default_channel(uid, info["channel_id"])
-    audit(uid, "channel_connected", info["channel_id"])
+    if not tokens.get("refresh_token"):
+        # Without a refresh token the access token dies in ~1 hour and uploads
+        # stop working, so tell the user how to force a new one.
+        notify(uid,
+               "⚠️ <b>Connected, but Google sent no refresh token.</b>\n\n"
+               "Access will expire in about an hour. To fix it, revoke the app at "
+               '<a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a> '
+               "and tap Connect YouTube again.")
 
     notify(uid,
            f"✅ <b>YouTube connected!</b>\n\n"
@@ -1916,6 +2120,9 @@ def yt_channel_kb(channels: list, uid: Optional[int] = None) -> types.InlineKeyb
     for ch in channels:
         kb.add(Btn(f"{G['eye']}  Stats · {ch['name'][:22]}",
                    callback_data=f"ch_stats:{ch['id']}", style="primary"))
+    for ch in channels:
+        kb.add(Btn(f"{G['trash']}  Disconnect · {ch['name'][:20]}",
+                   callback_data=f"yt_disconnect:{ch['id']}", style="danger"))
     kb.add(Btn(f"{G['plus']}  Add Channel", callback_data="yt_connect", style="success"))
     kb.add(Btn(f"{G['back']}  Back", callback_data="main_menu", style="danger"))
     return kb
@@ -2573,6 +2780,54 @@ def cb_yt_select(call):
               .add(Btn(f"{G['upload']}  Send videos", callback_data="yt_upload_now", style="success"))
               .add(Btn(f"{G['tiktok']}  Auto-post TikTok", callback_data="tk_menu", style="primary"))
               .add(Btn(f"{G['back']}  Channels", callback_data="yt_channels", style="primary")))
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("yt_disconnect:"))
+def cb_yt_disconnect(call):
+    """Confirm before forgetting a channel."""
+    uid = call.from_user.id
+    channel_id = call.data.split(":", 1)[1]
+    if not channel_row(uid, channel_id):
+        safe_answer(call, "Channel not found.", alert=True)
+        return
+    safe_answer(call)
+    safe_edit(call,
+              f"⚠️ <b>Disconnect {escape(channel_title(uid, channel_id))}?</b>\n\n"
+              "The bot forgets the tokens and revokes access at Google.\n"
+              "Queued uploads for this channel will fail until you reconnect it.",
+              types.InlineKeyboardMarkup(row_width=1)
+              .add(Btn(f"{G['trash']}  Yes, disconnect",
+                       callback_data=f"yt_disconnect_yes:{channel_id}", style="danger"))
+              .add(Btn(f"{G['back']}  Keep it", callback_data="yt_channels",
+                       style="primary")))
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("yt_disconnect_yes:"))
+def cb_yt_disconnect_yes(call):
+    """Delete the row and revoke the refresh token at Google."""
+    uid = call.from_user.id
+    channel_id = call.data.split(":", 1)[1]
+    name = channel_title(uid, channel_id)
+    if disconnect_channel(uid, channel_id):
+        safe_answer(call, f"Disconnected {name}")
+    else:
+        safe_answer(call, "Channel already removed.", alert=True)
+
+    channels = [{"id": c[0], "name": c[1]} for c in user_channels(uid)]
+    if channels:
+        safe_edit(call,
+                  f"✅ <b>{escape(name)}</b> disconnected.\n\n"
+                  f"📺 <b>Your YouTube Channels</b> ({len(channels)})",
+                  yt_channel_kb(channels, uid))
+    else:
+        safe_edit(call,
+                  f"✅ <b>{escape(name)}</b> disconnected.\n\n"
+                  "No channels connected. Tap below to link one.",
+                  types.InlineKeyboardMarkup(row_width=1)
+                  .add(Btn(f"{G['play']}  Connect YouTube", callback_data="yt_connect",
+                           style="success"))
+                  .add(Btn(f"{G['back']}  Back", callback_data="main_menu",
+                           style="danger")))
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("ch_stats:"))
@@ -4644,9 +4899,9 @@ def handle_text(message):
                          "Make sure you copy the <b>full URL</b> from the browser address bar.")
             return
 
-        # URL-decode the code (codes contain %2F which must become /)
-        raw_code = code_match.group(1)
-        auth_code = unquote(raw_code)
+        # Percent-decode the code exactly once (%2F -> /). extract_auth_code()
+        # is the same helper the Flask callback uses, so both paths agree.
+        auth_code = extract_auth_code(text)
 
         # Validate the code looks reasonable
         if len(auth_code) < 10:
@@ -4668,13 +4923,9 @@ def handle_text(message):
             tokens = yt_service.exchange_code(auth_code)
         except Exception as exc:
             err_text = str(exc)
-            # Try to parse Google's JSON error response for friendly messages
-            try:
-                err_json = exc.response.json() if hasattr(exc, "response") else {}
-            except Exception:
-                err_json = {}
-            error_code = err_json.get("error", "")
-            error_desc = err_json.get("error_description", err_text)
+            # _token_request() already parsed Google's JSON body into OAuthError.
+            error_code = getattr(exc, "error", "") or ""
+            error_desc = getattr(exc, "description", "") or err_text
 
             if error_code == "invalid_grant":
                 # The code may have been consumed by the server's Flask callback
@@ -4744,20 +4995,8 @@ def handle_text(message):
                 pass
             return
 
-        access = tokens.get("access_token", "")
-        db_query(
-            "INSERT OR REPLACE INTO youtube_channels "
-            "(user_id, channel_id, channel_name, access_token, refresh_token, token_expiry, "
-            "thumbnail, connected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                uid, info["channel_id"], info["channel_name"],
-                encrypt_data(access), encrypt_data(refresh),
-                expiry.isoformat(), info.get("thumbnail", ""),
-                datetime.utcnow().isoformat(),
-            ),
-        )
-        set_default_channel(uid, info["channel_id"])
-        audit(uid, "channel_connected", info["channel_id"])
+        # Same helper the Flask callback uses - one storage path, one bug surface.
+        save_channel_tokens(uid, tokens, info)
 
         try:
             bot.edit_message_text(
@@ -5177,6 +5416,10 @@ def startup_banner() -> None:
     print(f"🎞 ffmpeg: {'found' if shutil.which('ffmpeg') else 'missing'}")
     print(f"🍪 Social cookies: {'found' if os.path.isfile(SOCIAL_COOKIES_FILE) else 'missing'}")
     print(f"🔗 OAuth redirect URI: {YT_REDIRECT_URI}")
+    # Printed so it is obvious in host logs whether storage survives a redeploy.
+    print(f"🗄  Storage dir: {STORAGE_DIR}")
+    print(f"    Database:    {DB_FILE} "
+          f"({'exists' if DB_FILE.exists() else 'created now'})")
     try:
         me = bot.get_me()
         print(f"🤖 Signed in as @{me.username} (id {me.id})")
