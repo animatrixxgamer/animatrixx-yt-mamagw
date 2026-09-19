@@ -1,4 +1,5 @@
 # 🎬 YouTube Telegram Bot — Epic Edition
+![Made by Animatrixx Gamer](https://img.shields.io/badge/Made%20by-𝕬𝖓𝖎𝖒𝖆𝖙𝖗𝖎𝖝𝖝%20𝕲𝖆𝖒𝖊𝖗✪-red)
 
 A feature-packed Telegram bot for YouTube channel management, social video
 imports and script hosting, with colored inline buttons.
@@ -191,3 +192,5 @@ MIT License — feel free to use and modify!
 ## 🙏 Credits
 
 Built with ❤️ using pyTelegramBotAPI, yt-dlp, Google API Client, Flask and SQLite.
+
+**Created & Maintained by:** 𝕬𝖓𝖎𝖒𝖆𝖙𝖗𝖎𝖝𝖝 𝕲𝖆𝖒𝖊𝖗✪
