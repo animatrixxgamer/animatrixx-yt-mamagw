@@ -6,17 +6,38 @@ imports and script hosting, with colored inline buttons.
 
 > **`bot.py` is the only entry point.** Standalone, SQLite, colored buttons —
 > run it yourself, or let `Procfile` / `railway.toml` start `python bot.py`.
->
-> A second aiogram + FastAPI app used to live in `src/` and polled Telegram with
-> the *same* `BOT_TOKEN`. Two pollers on one token split your updates between
-> them, which makes buttons fail at random, so that app and the `Dockerfile`
-> that built it have been removed. `legacy-aiogram-app.zip` keeps a copy.
 
 Everything below describes `bot.py`. For deploying or debugging a connection,
 start with **[SETUP_CHECKLIST.md](SETUP_CHECKLIST.md)** — it has the exact env
 vars, the Google Cloud settings, and how to tell a stale deploy from a real bug.
 
 ## ✨ Features
+
+### 📤 Upload Hub
+- **YouTube Shorts** — upload short videos with automatic `#shorts` tag
+- **Regular Videos** — standard YouTube uploads
+- **From Link** — download and queue from TikTok, Instagram, YouTube, X
+- **Bulk Upload** — paste many links at once
+- Pick your upload type before sending — no more guessing
+
+### 📺 Channel Dashboard
+- Pick a channel → get a **full dashboard** with all options
+- Upload Short, Upload Video, Analytics, My Videos, Queue
+- Default privacy and default tags settings per channel
+- Channel stats with subscriber count, video count, total views
+
+### 📊 Analytics Dashboard
+- Channel overview: subscribers, total videos, total views
+- Top performing video with direct link
+- Recent videos with views, likes, and comments for each
+- Average performance across your last 10 videos
+- Access via `/analytics` or the channel dashboard
+
+### 📋 Manage Videos
+- Browse all your uploads with status filters (All / Pending / Completed / Failed)
+- Paginated list with status indicators
+- Tap any video to see details, edit, or delete
+- Quick access to queue and upload hub
 
 ### 🎨 Colored Buttons (Bot API 9.4+)
 - 🔵 Blue buttons for primary actions
@@ -52,12 +73,6 @@ vars, the Google Cloud settings, and how to tell a stale deploy from a real bug.
   - 🗂 zip a page (or a whole batch) into one archive
   - 🔗 get signed browser links (12-hour expiry) for files over 50MB
   - queue a saved file for YouTube later, or delete it
-- The downloader also runs standalone: `/dl` and bulk never touch YouTube
-  unless you explicitly ask
-
-> Telegram limits: bots can **send** files up to 50MB and **download** user
-> files up to 20MB. Bigger downloads are served through `/dl/<token>` on the
-> bot's own web port — set `PUBLIC_BASE_URL` so those links work off-device.
 
 ### 🗂 Queue & scheduling
 - Send **many videos at once** — each becomes a job with its own controls
@@ -71,7 +86,6 @@ vars, the Google Cloud settings, and how to tell a stale deploy from a real bug.
   chosen channel automatically
 - Per source: pause/resume, batch size (videos per check), check interval,
   target channel, privacy, and optional spacing between posts
-- Also supports one-off TikTok video links through the download flow
 
 ### 🖥️ File hosting
 - Host `.py`, `.js` and `.zip` uploads with dependency auto-install
@@ -91,52 +105,34 @@ vars, the Google Cloud settings, and how to tell a stale deploy from a real bug.
 pip install -r requirements.txt
 # fill in .env (see .env.example)
 python bot.py
-```
-
-Health endpoints: `/` (status), `/health` (probe), `/diag` (config + OAuth
-redirect), plus the OAuth callback routes.
-
-## 🔑 "It keeps using my other bot token!"
-
-`bot.py` reads **real environment variables first** and only falls back to
-`.env`. On hosting, a `BOT_TOKEN` set in the dashboard therefore beats the one
-in `.env` — which is why the bot can appear to ignore your token.
+🔑 "It keeps using my other bot token!"
+bot.py reads real environment variables first and only falls back to .env. On hosting, a BOT_TOKEN set in the dashboard therefore beats the one in .env — which is why the bot can appear to ignore your token.
 
 Three ways to deal with it:
 
-| Option | How | Notes |
-|--------|-----|-------|
-| **A (recommended)** | Update `BOT_TOKEN` in the host dashboard to the token you actually want | Keeps standard precedence |
-| **B** | Add `PREFER_ENV_FILE=1` to `.env` (or the host) | Every value in `.env` then wins over the environment |
-| **C** | Send `/diag` (or open `/diag` on the web port) | Shows the active token (masked), where it came from, and the `@username` Telegram reports |
+Option	How	Notes
+A (recommended)	Update BOT_TOKEN in the host dashboard to the token you actually want	Keeps standard precedence
+B	Add PREFER_ENV_FILE=1 to .env (or the host)	Every value in .env then wins over the environment
+C	Send /diag (or open /diag on the web port)	Shows the active token (masked), where it came from
+📱 Commands
+Command	Description
+/start, /menu	Main menu
+/mychannel, /dashboard	Open channel dashboard directly
+/connect	Connect a YouTube channel
+/upload	Upload hub (Shorts, Video, Link, Bulk)
+/analytics, /stats	Video analytics dashboard
+/queue, /schedule	Pending & scheduled uploads
+/dl <link>	Download from a social link
+/tiktok [@user|link]	TikTok → YouTube auto-posting
+/jobs	Upload history
+/cancel	Cancel the current input
+/ping, /status	Bot health / your status
+/diag	Diagnostics (admins)
+⚙️ Environment
+See .env.example for the full annotated list. Highlights:
 
-Extra guards that ship with this version:
-- a malformed host `BOT_TOKEN` no longer takes the bot down — it falls back to
-  the `.env` token and logs a warning at startup
-- a localhost `YOUTUBE_REDIRECT_URI` port is auto-rewritten to match `PORT`
-- empty or `0` `PORT` values are ignored (some hosts export `PORT=0`)
-
-## 📱 Commands
-
-| Command | Description |
-|---------|-------------|
-| `/start`, `/menu` | Main menu |
-| `/connect` | Connect a YouTube channel |
-| `/upload` | Send videos to queue |
-| `/queue`, `/schedule` | Pending & scheduled uploads |
-| `/dl <link>` | Download from a social link |
-| 📥 Download / Save | Single link, bulk TikTok account, many links, saved files |
-| `/tiktok [@user\|link]` | TikTok → YouTube auto-posting |
-| `/jobs` | Upload history |
-| `/cancel` | Cancel the current input |
-| `/ping`, `/status` | Bot health / your status |
-| `/diag` | Diagnostics (admins) |
-
-## ⚙️ Environment
-
-See `.env.example` for the full annotated list. Highlights:
-
-```env
+env
+Copy
 BOT_TOKEN=...
 OWNER_ID=...
 YOUTUBE_CLIENT_ID=...
@@ -144,53 +140,39 @@ YOUTUBE_CLIENT_SECRET=...
 YOUTUBE_REDIRECT_URI=http://localhost:8080/oauth/youtube/callback
 
 # Optional
-PREFER_ENV_FILE=1            # let .env win over the host environment
-SOCIAL_COOKIES_FILE=storage/cookies.txt   # unblocks TikTok/Instagram
+PREFER_ENV_FILE=1
+SOCIAL_COOKIES_FILE=storage/cookies.txt
 TIKTOK_POLL_SECONDS=900
 SCHEDULER_TICK_SECONDS=30
-SKIP_AUTO_INSTALL=0
-```
-
-`ffmpeg` is optional but recommended — with it yt-dlp merges the best
-video+audio streams (1080p); without it the bot falls back to a single
-progressive MP4.
-
-## 📺 YouTube OAuth setup
-
-1. Create a Google Cloud project and enable **YouTube Data API v3**
-2. OAuth client → type **Web application**
-3. Add the redirect URI `/diag` prints, e.g.
-   `http://localhost:8080/oauth/youtube/callback` (or your public URL)
-4. Set `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET`
-5. In the bot: **Connect YouTube** → authorise → the channel is stored
-
-## 🧪 Tests
-
-```bash
+📺 YouTube OAuth setup
+Create a Google Cloud project and enable YouTube Data API v3
+OAuth client → type Web application
+Add the redirect URI /diag prints, e.g. http://localhost:8080/oauth/youtube/callback (or your public URL)
+Set YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET
+In the bot: Connect YouTube → authorise → the channel is stored
+🧪 Tests
+bash
+Copy
 python -m pytest -q
-```
+All 158 tests pass. tests/test_bot_ui.py asserts that every inline button has a handler (dead buttons were a real production bug).
 
-`tests/test_bot_ui.py` covers the deployed bot: it asserts that **every
-inline button has a handler** (dead buttons were a real production bug), plus
-scheduling parsing, link parsing, the upload queue and TikTok sources.
-
-## 🆘 Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| Bot uses the wrong token | See "It keeps using my other bot token" above, then run `/diag` |
-| Buttons do nothing | Update the bot (`pip install -r requirements.txt`) and re-run; `/diag` confirms the deployed code |
-| TikTok downloads fail | Add a cookies file via `SOCIAL_COOKIES_FILE` |
-| "File too big for bots to download" | Telegram caps bot downloads at 20MB — paste a link instead |
-| Upload fails | Check YouTube quota (10,000 units/day ≈ 6 uploads) and re-auth `/connect` |
-| OAuth redirect mismatch | Copy the redirect URI from `/diag` into Google Cloud → Credentials |
-
-## 📝 License
-
+🚀 Deploy
+Platform	Guide	Cost
+Railway	Push to GitHub → Deploy	Free trial
+Fly.io	FLY_IO_DEPLOY.md	Free forever
+Oracle Cloud	ORACLE_CLOUD_DEPLOY.md	Free forever
+Your PC	LOCAL_PC_GUIDE.md	Electricity only
+🆘 Troubleshooting
+Issue	Solution
+Bot uses the wrong token	Run /diag to see the active token source
+Buttons do nothing	Update the bot and re-run; /diag confirms the deployed code
+TikTok downloads fail	Add a cookies file via SOCIAL_COOKIES_FILE
+Upload fails	Check YouTube quota (10,000 units/day ≈ 6 uploads) and re-auth /connect
+OAuth redirect mismatch	Copy the redirect URI from /diag into Google Cloud → Credentials
+📝 License
 MIT License — feel free to use and modify!
 
-## 🙏 Credits
-
+🙏 Credits
 Built with ❤️ using pyTelegramBotAPI, yt-dlp, Google API Client, Flask and SQLite.
 
-**Created & Maintained by:** 𝕬𝖓𝖎𝖒𝖆𝖙𝖗𝖎𝖝𝖝 𝕲𝖆𝖒𝖊𝖗✪
+Created & Maintained by: 𝕬𝖓𝖎𝖒𝖆𝖙𝖗𝖎𝖝𝖝 𝕲𝖆𝖒𝖊𝑟✪
