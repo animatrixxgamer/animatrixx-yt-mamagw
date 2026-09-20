@@ -1,0 +1,96 @@
+╔══════════════════════════════════════════════════════╗
+║  🤖  BOTFATHER SETUP — Copy & Paste Everything Below ║
+╚══════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📌 STEP 1: Set Bot Name
+   Command:  /setname
+   Reply:    FreeBuff — YouTube Bot
+
+📌 STEP 2: Set Bot Description (shown in chat info)
+   Command:  /setdescription
+   Reply:    
+🎬 Upload Shorts & Videos to YouTube from Telegram!
+
+📤 Upload Hub — Pick Shorts, Video, Link, or Bulk
+📊 Analytics — Views, likes, subscribers at a glance
+🔗 Import from TikTok, Instagram, YouTube, X & more
+🎵 TikTok → YouTube auto-posting
+📋 Queue, schedule & manage all your uploads
+🔒 Multi-channel support with encrypted OAuth
+🛡️ Admin panel with full controls
+
+⚡ Fast · 🔐 Secure · 💯 Free
+
+Start with /start 🚀
+
+📌 STEP 3: Set Bot About (short bio, 120 chars max)
+   Command:  /setabouttext
+   Reply:    
+🎬 YouTube upload bot — Shorts, Videos, Analytics, TikTok auto-post, social downloads. Free & open source! 🚀
+
+📌 STEP 4: Set Profile Picture
+   Command:  /setuserpic
+   Reply:    Upload the bot_profile_picture.html screenshot
+             (screenshot it at 512x512 from the Preview tab)
+
+📌 STEP 5: Set Commands
+   Command:  /setcommands
+   Reply:    
+
+start - 🏠 Start the bot & open main menu
+menu - 🏠 Open main menu
+mychannel - 📺 Open channel dashboard
+upload - 📤 Upload hub (Shorts, Video, Link, Bulk)
+connect - 🔗 Connect a YouTube channel
+analytics - 📊 Video analytics dashboard
+queue - 📋 View upload queue & scheduling
+dl - 📥 Download from a social link
+tiktok - 🎵 TikTok → YouTube auto-posting
+jobs - 📜 Upload history
+cancel - ❌ Cancel current action
+ping - 🏓 Check bot health
+status - 📊 Your account status
+help - 📖 How to use the bot
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📋 COPY-PASTE VERSION (all in one block):
+
+start - 🏠 Start the bot & open main menu
+menu - 🏠 Open main menu
+mychannel - 📺 Open channel dashboard
+upload - 📤 Upload hub (Shorts, Video, Link, Bulk)
+connect - 🔗 Connect a YouTube channel
+analytics - 📊 Video analytics dashboard
+queue - 📋 View upload queue & scheduling
+dl - 📥 Download from a social link
+tiktok - 🎵 TikTok → YouTube auto-posting
+jobs - 📜 Upload history
+cancel - ❌ Cancel current action
+ping - 🏓 Check bot health
+status - 📊 Your account status
+help - 📖 How to use the bot
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎨 PROFILE PICTURE:
+   Open bot_profile_picture.html in a browser
+   Screenshot it at 512x512 pixels
+   Upload to BotFather with /setuserpic
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💡 OPTIONAL: Set Inline Mode
+   Command:  /setinline
+   Reply:    Search videos...
+
+💡 OPTIONAL: Set Group Privacy
+   Command:  /setprivacy
+   Reply:    Disable (so bot works in groups too)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ DONE! Your bot is ready to go!
+   Send /start to test it out 🚀
