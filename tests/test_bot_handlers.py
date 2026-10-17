@@ -204,6 +204,7 @@ def test_every_menu_payload_runs(bot, monkeypatch):
         ("adm_broadcast", CHAT_ID),
         ("adm_broadcast_cancel", CHAT_ID),
         ("adm_settings", CHAT_ID),
+        ("adm_suball", CHAT_ID),
         ("adm_set_free", CHAT_ID),
         ("adm_audit", CHAT_ID),
         ("adm_diag", CHAT_ID),

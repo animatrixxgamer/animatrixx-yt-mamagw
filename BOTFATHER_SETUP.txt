@@ -41,17 +41,23 @@ Start with /start 🚀
 
 start - 🏠 Start the bot & open main menu
 menu - 🏠 Open main menu
-mychannel - 📺 Open channel dashboard
 upload - 📤 Upload hub (Shorts, Video, Link, Bulk)
+mychannel - 📺 Open channel dashboard
 connect - 🔗 Connect a YouTube channel
-analytics - 📊 Video analytics dashboard
 queue - 📋 View upload queue & scheduling
-dl - 📥 Download from a social link
+dl - 📥 Download from a social link (TikTok, IG, FB, YT, X...)
 tiktok - 🎵 TikTok → YouTube auto-posting
+cookies - 🍪 Upload cookies.txt to unblock TikTok/YouTube (admin)
+suball - 📺 Subscribe all connected channels (admin)
+analytics - 📊 Video analytics dashboard
 jobs - 📜 Upload history
+summary - 📊 Health summary (disk, jobs, channels)
+plan - ⭐ Your plan & limits
 cancel - ❌ Cancel current action
 ping - 🏓 Check bot health
 status - 📊 Your account status
+oauthcheck - 🔧 Why is Connect YouTube failing?
+diag - 🩺 Bot diagnostics (admin)
 help - 📖 How to use the bot
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -60,17 +66,23 @@ help - 📖 How to use the bot
 
 start - 🏠 Start the bot & open main menu
 menu - 🏠 Open main menu
-mychannel - 📺 Open channel dashboard
 upload - 📤 Upload hub (Shorts, Video, Link, Bulk)
+mychannel - 📺 Open channel dashboard
 connect - 🔗 Connect a YouTube channel
-analytics - 📊 Video analytics dashboard
 queue - 📋 View upload queue & scheduling
-dl - 📥 Download from a social link
+dl - 📥 Download from a social link (TikTok, IG, FB, YT, X...)
 tiktok - 🎵 TikTok → YouTube auto-posting
+cookies - 🍪 Upload cookies.txt to unblock TikTok/YouTube (admin)
+suball - 📺 Subscribe all connected channels (admin)
+analytics - 📊 Video analytics dashboard
 jobs - 📜 Upload history
+summary - 📊 Health summary (disk, jobs, channels)
+plan - ⭐ Your plan & limits
 cancel - ❌ Cancel current action
 ping - 🏓 Check bot health
 status - 📊 Your account status
+oauthcheck - 🔧 Why is Connect YouTube failing?
+diag - 🩺 Bot diagnostics (admin)
 help - 📖 How to use the bot
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
