@@ -11,3 +11,6 @@ google-auth-httplib2>=0.1.1
 # Newer releases fix the Facebook parser crash and TikTok profile errors that
 # older versions hit; keep this pinned high.
 yt-dlp>=2026.8.19
+# Browser TLS impersonation for yt-dlp: without this TikTok's WAF serves a
+# challenge page instead of the profile, so cookies can never fix it.
+curl_cffi>=0.12.0

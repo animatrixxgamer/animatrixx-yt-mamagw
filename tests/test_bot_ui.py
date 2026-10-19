@@ -11,6 +11,7 @@ that used to break in production:
 """
 
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -651,6 +652,116 @@ class TestStorageAndCookies:
         # Tabs but no known host and no Netscape header.
         assert bot_module.save_cookies_file("a\tb\tc\td") is False
         assert not target.exists()
+
+    def test_save_cookies_file_accepts_cookie_editor_json(self, bot_module,
+                                                          tmp_path, monkeypatch):
+        """Cookie-Editor's JSON export is converted to the Netscape format
+        yt-dlp can actually read, instead of being rejected as junk."""
+        target = tmp_path / "cookies.txt"
+        monkeypatch.setattr(bot_module, "SOCIAL_COOKIES_FILE", str(target))
+        content = json.dumps([
+            {"name": "sessionid", "value": "abc", "domain": ".tiktok.com",
+             "path": "/", "secure": True, "httpOnly": True,
+             "expirationDate": 1823788921},
+            {"name": "ttwid", "value": "zzz", "domain": ".tiktok.com",
+             "path": "/", "secure": True, "httpOnly": True, "session": True},
+        ])
+        assert bot_module.save_cookies_file(content) is True
+        saved = target.read_text(encoding="utf-8")
+        assert saved.startswith("# Netscape")
+        assert "sessionid" in saved and "1823788921" in saved
+        # session cookies have no expiry -> column is 0, not blank
+        assert "\t0\tttwid\tzzz" in saved
+
+    def test_parse_cookies_preserves_httponly(self, bot_module):
+        content = ("# Netscape HTTP Cookie File\n"
+                   "#HttpOnly_.tiktok.com\tTRUE\t/\tTRUE\t0\tsessionid\tabc123\n")
+        rows = bot_module.parse_cookies_text(content)
+        assert rows and rows[0]["name"] == "sessionid"
+        assert rows[0]["http_only"] is True
+        out = bot_module.cookies_to_netscape(rows)
+        assert out.startswith("# Netscape")
+        assert "#HttpOnly_.tiktok.com\tTRUE" in out
+
+    def test_audit_cookies_flags_expired_and_logged_out(self, bot_module):
+        """The check the /cookies upload now performs: is the file even
+        capable of helping? Expired junk and logged-out exports say so."""
+        now = int(time.time())
+        content = ("# Netscape HTTP Cookie File\n"
+                   f".tiktok.com\tTRUE\t/\tTRUE\t{now - 100}\tmsToken\told\n"
+                   ".tiktok.com\tTRUE\t/\tTRUE\t0\tttwid\tzzz\n")
+        audit = bot_module.audit_cookies(content)
+        assert audit["ok"] is True
+        assert "msToken" in audit["expired"]
+        assert "tiktok.com" in audit["missing_login"]  # no sessionid
+        text = bot_module.format_cookie_audit(audit)
+        assert "Already expired" in text
+        assert "Logged-out export" in text
+
+    def test_audit_cookies_sees_logged_in_session(self, bot_module):
+        content = ("# Netscape HTTP Cookie File\n"
+                   ".tiktok.com\tTRUE\t/\tTRUE\t0\tsessionid\tabc\n")
+        audit = bot_module.audit_cookies(content)
+        assert audit["missing_login"] == []
+        assert audit["expired"] == []
+        assert "logged-in session present" in bot_module.format_cookie_audit(audit)
+
+    def test_cookies_test_report_tells_the_three_failures_apart(self, bot_module,
+                                                                monkeypatch):
+        """pass / bad cookies / IP blocked — the verdict the old flow never
+        gave. probe_profile_access is stubbed; only the decision is tested."""
+        def stub(results):
+            queue = list(results)
+            def probe(use_cookies=True, profile_url=""):
+                return queue.pop(0)
+            return probe
+
+        monkeypatch.setattr(bot_module, "probe_profile_access",
+                            stub([(True, "3 videos read")]))
+        assert "Live test passed" in bot_module.cookies_test_report()
+
+        monkeypatch.setattr(bot_module, "probe_profile_access",
+                            stub([(False, "secondary user ID"),
+                                  (True, "3 videos read")]))
+        assert "these cookies are the problem" in bot_module.cookies_test_report()
+
+        monkeypatch.setattr(bot_module, "probe_profile_access",
+                            stub([(False, "WAF challenge"),
+                                  (False, "WAF challenge")]))
+        report = bot_module.cookies_test_report()
+        assert "your IP is blocked" in report
+        assert "SOCIAL_PROXY" in report  # the actionable no-cookies fix
+
+    def test_cookies_file_hint_reflects_saved_file(self, bot_module, tmp_path,
+                                                   monkeypatch):
+        monkeypatch.setattr(bot_module, "SOCIAL_COOKIES_FILE",
+                            str(tmp_path / "missing.txt"))
+        assert "No cookies file" in bot_module.cookies_file_hint()
+
+        good = tmp_path / "cookies.txt"
+        good.write_text("# Netscape HTTP Cookie File\n"
+                        ".tiktok.com\tTRUE\t/\tTRUE\t0\tsessionid\tabc\n",
+                        encoding="utf-8")
+        monkeypatch.setattr(bot_module, "SOCIAL_COOKIES_FILE", str(good))
+        assert "look current" in bot_module.cookies_file_hint()
+
+        logged_out = tmp_path / "logged_out.txt"
+        logged_out.write_text("# Netscape HTTP Cookie File\n"
+                              ".tiktok.com\tTRUE\t/\tTRUE\t0\tttwid\tzzz\n",
+                              encoding="utf-8")
+        monkeypatch.setattr(bot_module, "SOCIAL_COOKIES_FILE", str(logged_out))
+        assert "logged out of tiktok.com" in bot_module.cookies_file_hint()
+
+    def test_ytdlp_opts_honour_proxy_and_cookie_toggle(self, bot_module,
+                                                       monkeypatch):
+        monkeypatch.setattr(bot_module, "SOCIAL_COOKIES_FILE", "/nonexistent.txt")
+        monkeypatch.setattr(bot_module, "SOCIAL_PROXY", "socks5://127.0.0.1:1080")
+        opts = bot_module._ytdlp_opts()
+        assert opts["proxy"] == "socks5://127.0.0.1:1080"
+        assert "cookiefile" not in opts  # file missing -> no cookiejar
+        # The live test reads without cookies on purpose.
+        assert "cookiefile" not in bot_module._ytdlp_opts({"x": 1},
+                                                           use_cookies=False)
 
     def test_sweep_removes_stale_but_keeps_active_files(self, bot_module, tmp_path, monkeypatch):
         """Old downloads go; anything an active job still needs stays."""

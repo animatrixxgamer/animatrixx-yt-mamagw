@@ -72,10 +72,15 @@ vars, the Google Cloud settings, and how to tell a stale deploy from a real bug.
   (set `STORAGE_KEEP_HOURS` to tune the hourly cleanup sweep, `0` disables it)
 - Adding an account **succeeds even when the first check fails** (TikTok
   blocks most server IPs) — the watcher keeps retrying on its own
-- **`/cookies`** — upload a browser `cookies.txt` export right in the chat
-  (owner/admin only). This is the fix for "Your IP address is blocked" on
-  Railway/Render/VPS hosts; TikTok, YouTube, Instagram and Facebook downloads
-  all use the uploaded cookies
+- **`/cookies`** — upload a browser cookies export right in the chat
+  (owner/admin only), as a **Netscape `cookies.txt`** *or* a Cookie-Editor
+  **JSON** export (auto-converted). The bot then **validates the file**
+  (parses it, flags expired cookies and logged-out sessions) and runs a
+  **live test with and without the cookies** so you learn which of the three
+  failure modes you have: junk file, bad cookies, or your server IP being
+  blocked (only the last one needs `SOCIAL_PROXY=` instead of cookies).
+  TikTok, YouTube, Instagram and Facebook downloads all use the one
+  uploaded file — a single export covers every user of the bot
 - TikTok **photo posts** (`/photo/` links) can't be downloaded — yt-dlp does
   not support them at all — so the bot says so plainly instead of erroring
 - Per source: pause/resume, batch size (videos per check), check interval,
@@ -165,6 +170,7 @@ YOUTUBE_REDIRECT_URI=http://localhost:8080/oauth/youtube/callback
 # Optional
 PREFER_ENV_FILE=1            # let .env win over the host environment
 SOCIAL_COOKIES_FILE=storage/cookies.txt   # unblocks TikTok/Instagram
+SOCIAL_PROXY=socks5://user:pass@host:1080  # optional: fix IP blocks without cookies
 TIKTOK_POLL_SECONDS=900
 SCHEDULER_TICK_SECONDS=30
 SKIP_AUTO_INSTALL=0

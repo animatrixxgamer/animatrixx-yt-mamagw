@@ -20,7 +20,7 @@ import threading
 import time
 import traceback
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
@@ -39,6 +39,7 @@ _REQUIRED_PKGS = [
     ("googleapiclient", "google-api-python-client"),
     ("google_auth_oauthlib", "google-auth-oauthlib"),
     ("yt_dlp", "yt-dlp"),
+    ("curl_cffi", "curl_cffi"),
 ]
 
 
@@ -642,6 +643,11 @@ SOCIAL_COOKIES_FILE = (
 )
 SOCIAL_MAX_DURATION = int(os.environ.get("SOCIAL_MAX_DURATION", 600))
 SOCIAL_MAX_HEIGHT = int(os.environ.get("SOCIAL_MAX_HEIGHT", 1080))
+# Optional outbound proxy for every yt-dlp request ("socks5://user:pass@host:port"
+# or "http://host:port"). TikTok's WAF blocks by IP: when the block is the
+# server's IP, no cookie can help — a proxy changes the IP instead.
+SOCIAL_PROXY = (os.environ.get("SOCIAL_PROXY") or os.environ.get("COOKIES_PROXY")
+                or "").strip()
 # Downloaded social files are deleted once their upload finishes, and a sweep
 # removes anything older than this many hours (0 disables the sweep). Without
 # this the server disk fills up with videos that already live on YouTube.
@@ -2769,30 +2775,272 @@ def is_tiktok_photo_url(url: str) -> bool:
     return "tiktok.com" in low and "/photo/" in low
 
 
-def save_cookies_file(content: str) -> bool:
-    """Persist an uploaded Netscape cookies export for yt-dlp.
+# ── Cookies: parsing, validation, live testing ─────────────────────
+# Two upload formats are accepted, because "cookies.txt" means different
+# things in different extensions:
+#   * Netscape cookies.txt — 7 tab-separated columns (Get cookies.txt LOCALLY,
+#     Cookie-Editor "Export as Netscape"); yt-dlp can only read this format
+#   * Cookie-Editor JSON export — converted to Netscape on save
+# Saving blindly was the old behaviour; the audit + live test below exist so
+# the bot can say WHICH of the three failure modes we have:
+#   junk file / logged-out-or-expired cookies / the server IP is blocked.
 
-    TikTok (and YouTube/Facebook) block data-center IPs, so a logged-in browser
-    cookies export is the only reliable fix on a hosted server. Returns True
-    when the content looks like a real cookies file and was written.
+_COOKIE_HOSTS = ("tiktok.com", "instagram.com", "youtube.com", "google.com",
+                 "facebook.com", "x.com", "twitter.com")
+
+# Cookies that only exist for a genuinely logged-in session, per site.
+# Any ONE name in the list counts as "logged in".
+_LOGIN_COOKIES = {
+    "tiktok.com": ("sessionid", "sessionid_ss"),
+    "youtube.com": ("SID", "__Secure-3PSID", "LOGIN_INFO"),
+    "google.com": ("SID", "__Secure-3PSID"),
+    "instagram.com": ("sessionid", "ds_user_id"),
+    "facebook.com": ("c_user", "xs"),
+    "x.com": ("auth_token",),
+    "twitter.com": ("auth_token",),
+}
+
+# Public profile used by /cookies to prove this network can read TikTok.
+TIKTOK_TEST_PROFILE = (os.environ.get("TIKTOK_TEST_PROFILE")
+                       or "https://www.tiktok.com/@tiktok")
+
+
+def _cookie_site(domain: str) -> str:
+    """Map a cookie domain to its well-known site (www.tiktok.com -> tiktok.com)."""
+    host = (domain or "").lstrip(".").lower()
+    for site in _COOKIE_HOSTS:
+        if host == site or host.endswith("." + site):
+            return site
+    return host
+
+
+def parse_cookies_text(content: str) -> list[dict] | None:
+    """Parse a cookies export — Netscape OR Cookie-Editor JSON — into rows.
+
+    Rows carry the seven Netscape columns so they can be written back
+    verbatim. Returns None when the content is neither format.
     """
     text = (content or "").strip()
-    if not text or "\t" not in text:
+    if not text:
+        return None
+    if text[0] in "[{":
+        return _cookies_from_json(text)
+    rows: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        http_only = line.startswith("#HttpOnly_")
+        if http_only:
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue  # format header / comment
+        parts = line.split("\t")
+        if len(parts) != 7 or not parts[5]:
+            continue
+        rows.append({"domain": parts[0], "include_subdomains": parts[1],
+                     "path": parts[2], "secure": parts[3], "expiry": parts[4],
+                     "name": parts[5], "value": parts[6], "http_only": http_only})
+    return rows or None
+
+
+def _cookies_from_json(text: str) -> list[dict] | None:
+    """Cookie-Editor "Export as JSON" — converted to Netscape rows."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, dict):
+        data = data.get("cookies") or data.get("cookieList") or []
+    if not isinstance(data, list):
+        return None
+    rows: list[dict] = []
+    for c in data:
+        if not isinstance(c, dict) or not c.get("name") or not c.get("domain"):
+            continue
+        exp = c.get("expirationDate", c.get("expires", c.get("expiry", 0)))
+        try:
+            exp = int(float(exp))
+        except (TypeError, ValueError):
+            exp = 0
+        domain = str(c["domain"])
+        rows.append({"domain": domain,
+                     "include_subdomains": "TRUE" if domain.startswith(".") else "FALSE",
+                     "path": str(c.get("path") or "/"),
+                     "secure": "TRUE" if c.get("secure") else "FALSE",
+                     "expiry": str(max(0, exp)), "name": str(c["name"]),
+                     "value": str(c.get("value") or ""),
+                     "http_only": bool(c.get("httpOnly"))})
+    return rows or None
+
+
+def cookies_to_netscape(rows: list[dict]) -> str:
+    """Render parsed rows back into the only format yt-dlp can read."""
+    out = ["# Netscape HTTP Cookie File",
+           "# http://curl.haxx.se/rfc/cookie_spec.html"]
+    for r in rows:
+        prefix = "#HttpOnly_" if r.get("http_only") else ""
+        out.append(prefix + "\t".join([r["domain"], r["include_subdomains"],
+                                       r["path"], r["secure"], r["expiry"],
+                                       r["name"], r["value"]]))
+    return "\n".join(out)
+
+
+def save_cookies_file(content: str) -> bool:
+    """Persist an uploaded cookies export for yt-dlp, normalised to Netscape.
+
+    Accepts a Netscape cookies.txt or a Cookie-Editor JSON export (converted).
+    Returns True when the content parses as a real cookies file and was
+    written; junk never overwrites the previous good file.
+    """
+    text = (content or "").strip()
+    if not text:
         return False
-    low = text.lower()
-    if "netscape" not in low and not any(
-            host in low for host in ("tiktok.com", "instagram.com", "youtube.com",
-                                     "facebook.com", "x.com", "twitter.com")):
+    rows = parse_cookies_text(text)
+    if not rows:
+        return False
+    known = any(_cookie_site(r["domain"]) in _COOKIE_HOSTS for r in rows)
+    if not known and "netscape" not in text.lower():
+        # Tab-separated junk can still parse into 7 columns — demand a
+        # site we actually scrape (or a real Netscape header).
         return False
     try:
-        Path(SOCIAL_COOKIES_FILE).write_text(text + "\n", encoding="utf-8")
+        Path(SOCIAL_COOKIES_FILE).write_text(cookies_to_netscape(rows) + "\n",
+                                             encoding="utf-8")
     except OSError as exc:
         print(f"[cookies] could not save: {exc}")
         return False
     return True
 
 
-def _ytdlp_opts(extra: Optional[dict] = None) -> dict:
+def audit_cookies(content: str) -> dict:
+    """Static health check of an export: counts, expiry, login sessions.
+
+    Pure parsing — no network. The result tells the admin whether the file
+    is even capable of helping (a logged-out export cannot unblock anything).
+    """
+    rows = parse_cookies_text(content) or []
+    now = time.time()
+    sites: dict[str, list[str]] = {}
+    expired: list[str] = []
+    expiring: list[tuple[str, int]] = []
+    for r in rows:
+        site = _cookie_site(r["domain"])
+        sites.setdefault(site, []).append(r["name"])
+        try:
+            exp = int(r["expiry"])
+        except (TypeError, ValueError):
+            exp = 0
+        if exp and exp <= now:
+            expired.append(r["name"])
+        elif exp and exp <= now + 7 * 86400:
+            expiring.append((r["name"], exp))
+    missing_login = sorted(
+        site for site, names in sites.items()
+        if site in _LOGIN_COOKIES
+        and not any(n in names for n in _LOGIN_COOKIES[site]))
+    return {"ok": bool(rows), "count": len(rows), "sites": sites,
+            "expired": sorted(set(expired)),
+            "expiring": sorted(expiring, key=lambda x: x[1]),
+            "missing_login": missing_login}
+
+
+def format_cookie_audit(audit: dict) -> str:
+    """Telegram-HTML summary of audit_cookies() for the /cookies reply."""
+    if not audit.get("ok"):
+        return "❌ Could not parse any cookies from that file."
+    site_names = sorted(audit["sites"])
+    lines = [f"🍪 {audit['count']} cookies parsed (sites: "
+             + escape(", ".join(site_names[:6])
+                       + (f" +{len(site_names) - 6}" if len(site_names) > 6 else ""))
+             + ")"]
+    if audit["expired"]:
+        lines.append("⚠️ Already expired: "
+                     + escape(", ".join(audit["expired"][:6]))
+                     + " — export a fresh file while logged in.")
+    if audit["expiring"]:
+        lines.append("⏰ Expiring soon: " + escape(", ".join(
+            f"{name} ({datetime.fromtimestamp(exp, tz=UTC):%b %d})"
+            for name, exp in audit["expiring"][:4])))
+    if audit["missing_login"]:
+        lines.append("❌ Logged-out export — no login session for: "
+                     + escape(", ".join(audit["missing_login"]))
+                     + ". Open that site <b>while logged in</b> and export "
+                       "again; a logged-out file does not unblock anything.")
+    for site in site_names:
+        if site in _LOGIN_COOKIES and site not in audit["missing_login"]:
+            lines.append(f"✅ {site}: logged-in session present")
+    return "\n".join(lines)
+
+
+def probe_profile_access(use_cookies: bool = True,
+                         profile_url: str = "") -> tuple[bool, str]:
+    """Live test: can the bot read a public TikTok profile right now?
+
+    Runs the exact call the watcher makes, so a pass here means the next
+    check will work, and a fail reproduces the user's error verbatim.
+    """
+    try:
+        videos = list_profile_videos(profile_url or TIKTOK_TEST_PROFILE,
+                                     limit=3, use_cookies=use_cookies)
+    except Exception as exc:
+        return False, str(exc)[:220]
+    if not videos:
+        return False, "profile loaded but returned 0 videos"
+    return True, f"{len(videos)} videos read"
+
+
+def cookies_test_report() -> str:
+    """Verdict after an upload: do these cookies help, or is the IP blocked?
+
+    The difference matters: an IP block cannot be fixed by any cookie, and a
+    logged-out export cannot be fixed by re-uploading it. Probing with and
+    without the file is what tells the two apart.
+    """
+    ok_with, det_with = probe_profile_access(True)
+    if ok_with:
+        return ("✅ <b>Live test passed</b> — these cookies work.\n"
+                f"Read <code>{escape(det_with)}</code> from a public profile; "
+                "the watcher will pick up videos on its next run.")
+    ok_without, _ = probe_profile_access(False)
+    if ok_without:
+        return ("❌ <b>Live test failed — these cookies are the problem.</b>\n"
+                "TikTok reads fine <i>without</i> them, so this export is bad "
+                "(logged-out session or expired). Open tiktok.com "
+                "<b>while logged in</b> and export again.\n"
+                f"<code>{escape(det_with[:200])}</code>")
+    return ("🚫 <b>Live test failed — your IP is blocked, not your cookies.</b>\n"
+            "TikTok refuses this server with <i>and</i> without cookies "
+            "(WAF challenge), so no cookies file can fix it.\n"
+            "Fixes: set <code>SOCIAL_PROXY=socks5://user:pass@host:port</code> "
+            "on the host and restart, run the bot from a residential network, "
+            "or use a TikTok data API.\n"
+            f"<code>{escape(det_with[:200])}</code>")
+
+
+def cookies_file_hint() -> str:
+    """One-line status of the saved cookies file, appended to failure notices."""
+    if not os.path.isfile(SOCIAL_COOKIES_FILE):
+        return "🍪 No cookies file on this server yet — send /cookies to upload one."
+    try:
+        content = Path(SOCIAL_COOKIES_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    a = audit_cookies(content)
+    if not a["ok"]:
+        return "🍪 The saved cookies file doesn't parse — send /cookies to replace it."
+    notes = []
+    if a["expired"]:
+        notes.append(f"{len(a['expired'])} expired")
+    if a["missing_login"]:
+        notes.append("logged out of " + ", ".join(a["missing_login"]))
+    if not notes:
+        return "🍪 Cookies on file look current."
+    return ("🍪 Cookies on file: " + "; ".join(notes)
+            + " — export a fresh file and send /cookies.")
+
+
+def _ytdlp_opts(extra: dict | None = None, use_cookies: bool = True) -> dict:
     opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -2801,8 +3049,10 @@ def _ytdlp_opts(extra: Optional[dict] = None) -> dict:
         "socket_timeout": 30,
         "noplaylist": True,
     }
-    if os.path.isfile(SOCIAL_COOKIES_FILE):
+    if use_cookies and os.path.isfile(SOCIAL_COOKIES_FILE):
         opts["cookiefile"] = SOCIAL_COOKIES_FILE
+    if SOCIAL_PROXY:
+        opts["proxy"] = SOCIAL_PROXY
     if extra:
         opts.update(extra)
     return opts
@@ -2913,12 +3163,13 @@ TG_SEND_LIMIT = 50 * 1024 * 1024
 BULK_MAX_VIDEOS = int(os.environ.get("BULK_MAX_VIDEOS", 50))
 
 
-def list_profile_videos(profile_url: str, limit: int = 10) -> List[dict]:
+def list_profile_videos(profile_url: str, limit: int = 10,
+                        use_cookies: bool = True) -> List[dict]:
     """List the most recent videos of a profile (newest first when possible)."""
     from yt_dlp import YoutubeDL
 
     opts = _ytdlp_opts({"extract_flat": "in_playlist", "skip_download": True,
-                        "playlistend": max(1, limit)})
+                        "playlistend": max(1, limit)}, use_cookies=use_cookies)
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(profile_url, download=False)
     entries = [e for e in (info.get("entries") or []) if e]
@@ -3004,8 +3255,11 @@ def run_job_upload(job_id: int, quiet: bool = False) -> bool:
                      (message, job_id))
             notify(uid, f"❌ Job #{job_id} failed to download:\n"
                         f"<code>{escape(message)}</code>\n\n"
-                        "Server IPs are often blocked — send /cookies and upload a "
-                        "cookies.txt from your browser, then retry the job.")
+                        f"{cookies_file_hint()}\n"
+                        "Server IPs are often blocked — send /cookies to upload a "
+                        "Netscape cookies.txt (Cookie-Editor JSON works too); the bot "
+                        "tests the file automatically and says whether cookies help "
+                        "or the IP itself is blocked, then retry the job.")
             return False
         file_path = str(dl_path)
         db_query('UPDATE upload_jobs SET file_path = ? WHERE job_id = ?',
@@ -3162,8 +3416,11 @@ def poll_source(source_id: int, announce: bool = True) -> int:
         if announce:
             notify(uid, f"⚠️ TikTok check failed for @{escape(handle)}:\n"
                         f"<code>{escape(str(exc)[:300])}</code>\n\n"
-                        f"TikTok often blocks data-center IPs — send <code>/cookies</code> "
-                        f"and upload a cookies.txt from your browser to fix this.")
+                        f"{cookies_file_hint()}\n"
+                        "TikTok blocks many server IPs. Send <code>/cookies</code> to "
+                        "upload a <b>Netscape cookies.txt</b> (Cookie-Editor JSON export "
+                        "also works) — the bot validates the file and runs a live test "
+                        "that tells you whether cookies help or your IP itself is blocked.")
         return 0
 
     queued = 0
@@ -4214,12 +4471,19 @@ def cmd_cookies(message):
         message,
         "🍪 <b>Send me the cookies file</b> (as a document, not pasted text)\n\n"
         "TikTok blocks server IPs, so the bot needs a logged-in cookies export "
-        "to read profiles and download videos.\n\n"
-        "<b>How to get it:</b>\n"
-        "1. Install the <b>Get cookies.txt LOCALLY</b> browser extension\n"
-        "2. Open tiktok.com while logged in\n"
-        "3. Click the extension → Export → save the file\n"
-        "4. Send that file here\n\n"
+        "to read profiles and download videos. <b>One upload is enough</b> — "
+        "the file is shared by every user of this bot and lasts for months.\n\n"
+        "<b>Accepted formats (either one):</b>\n"
+        "1. <b>Netscape cookies.txt</b> — 7 tab-separated columns. Extensions: "
+        "<b>Get cookies.txt LOCALLY</b> or Cookie-Editor → Export → "
+        "<b>Netscape format</b>\n"
+        "2. <b>Cookie-Editor JSON</b> export (<code>cookies.json</code>) — "
+        "converted automatically\n\n"
+        "Export from tiktok.com while <b>logged in</b> (the bot checks for the "
+        "login cookies and warns if the file is a logged-out session).\n\n"
+        "After the upload the bot runs a <b>live test</b> and tells you whether "
+        "the cookies work, are expired, or your server IP itself is blocked "
+        "(in that case set <code>SOCIAL_PROXY</code> instead).\n"
         "YouTube downloads need youtube.com cookies the same way.\n"
         "<i>Send /cancel to abort.</i>",
         disable_web_page_preview=True)
@@ -5577,8 +5841,10 @@ def start_link_download(uid: int, chat_id: int, url: str, edit_message: Optional
         except Exception as exc:
             try:
                 bot.edit_message_text(f"❌ Download failed:\n<code>{escape(str(exc)[:300])}</code>\n\n"
-                                      "Server IPs are often blocked — send /cookies and upload "
-                                      "a cookies.txt from your browser to fix most of these.",
+                                      f"{cookies_file_hint()}\n"
+                                      "Server IPs are often blocked — send /cookies to "
+                                      "upload a Netscape cookies.txt (JSON export works "
+                                      "too); the bot validates and live-tests it for you.",
                                       chat_id, msg_id)
             except Exception:
                 pass
@@ -5904,9 +6170,11 @@ def add_tiktok_source(uid: int, chat_id: int, handle_or_url: str) -> bool:
                 bot.edit_message_text(
                     f"⚠️ <b>@{escape(handle)} added, but the first check failed</b>\n"
                     f"<code>{escape(str(exc)[:280])}</code>\n\n"
-                    "TikTok blocks most server IPs. Send <code>/cookies</code> and "
-                    "upload a cookies.txt exported from your browser while logged "
-                    "into TikTok — the watcher will then pick up videos on its own.",
+                    f"{cookies_file_hint()}\n\n"
+                    "Send <code>/cookies</code> with a cookies export from your browser "
+                    "(Netscape cookies.txt or Cookie-Editor JSON) — the bot tests it "
+                    "live and says whether cookies help or your IP itself is blocked. "
+                    "The source keeps retrying on its own either way.",
                     chat_id, msg.message_id, reply_markup=tk_kb(uid))
             except Exception:
                 pass
@@ -7066,8 +7334,11 @@ def handle_document(message):
         clear_state(uid)
         if not is_admin(uid):
             return
-        if ext not in (".txt", ".cookies") and not fname.lower().endswith("cookies.txt"):
-            bot.reply_to(message, "❌ Send the exported <code>cookies.txt</code> file.")
+        if ext not in (".txt", ".cookies", ".json") and not fname.lower().endswith(
+                ("cookies.txt", "cookies.json")):
+            bot.reply_to(message,
+                         "❌ Send a cookies export file: <b>cookies.txt</b> "
+                         "(Netscape format) or Cookie-Editor's <b>cookies.json</b>.")
             return
         try:
             info = bot.get_file(doc.file_id)
@@ -7078,15 +7349,36 @@ def handle_document(message):
             return
         if save_cookies_file(content):
             audit(uid, "cookies_uploaded", fname)
-            bot.reply_to(message,
-                         f"✅ <b>Cookies saved</b> ({human_size(len(raw))})\n\n"
-                         "TikTok and YouTube requests now use them. Try adding "
-                         "the account again — /tiktok")
+            report = format_cookie_audit(audit_cookies(content))
+            saved_msg = bot.reply_to(
+                message,
+                f"✅ <b>Cookies saved</b> ({human_size(len(raw))})\n\n"
+                f"{report}\n\n"
+                "🧪 <b>Running a live test…</b> I'll read a public TikTok profile "
+                "with and without these cookies and tell you what is actually "
+                "blocking us — cookies, or the server IP.")
+
+            def _cookie_test_worker():
+                try:
+                    verdict = cookies_test_report()
+                except Exception as exc:
+                    verdict = f"🧪 Live test crashed: <code>{escape(str(exc)[:200])}</code>"
+                try:
+                    bot.reply_to(saved_msg, verdict)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_cookie_test_worker, daemon=True).start()
         else:
             bot.reply_to(message,
-                         "❌ That file doesn't look like a Netscape cookies export.\n\n"
-                         "Use the <b>Get cookies.txt LOCALLY</b> extension on "
-                         "tiktok.com and send the file it produces.")
+                         "❌ I couldn't read that as a cookies export.\n\n"
+                         "<b>Accepted formats:</b>\n"
+                         "• <b>Netscape cookies.txt</b> — 7 tab-separated columns "
+                         "(extensions: <b>Get cookies.txt LOCALLY</b>, Cookie-Editor → "
+                         "Export → <b>Netscape format</b>)\n"
+                         "• <b>Cookie-Editor JSON</b> export (<code>cookies.json</code>)\n\n"
+                         "Export from tiktok.com while <b>logged in</b>, then send "
+                         "the file again.")
         return
 
     if ext in VIDEO_EXTS or state.get("state") == "waiting_video":
@@ -7568,8 +7860,10 @@ def handle_text(message):
                     bot.edit_message_text(
                         f"❌ Could not read <b>@{escape(handle)}</b>:\n"
                         f"<code>{escape(str(exc)[:250])}</code>\n\n"
-                        f"TikTok blocks many data-centre IPs — send /cookies and "
-                        f"upload a cookies.txt from your browser.",
+                        f"{cookies_file_hint()}\n"
+                        f"TikTok blocks many data-centre IPs — send /cookies to upload "
+                        f"a Netscape cookies.txt (Cookie-Editor JSON works too); the bot "
+                        f"live-tests the file and tells you if the IP itself is blocked.",
                         message.chat.id, msg.message_id)
                 except Exception:
                     pass
