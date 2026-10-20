@@ -18,6 +18,7 @@ import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -155,6 +156,54 @@ def test_poll_source_announces_error_once_then_recovery(bot, monkeypatch, sent):
         monkeypatch.setattr(bot, "list_profile_videos", boom)
         assert bot.poll_source(src_id) == 0
         assert len(sent) == 4
+    finally:
+        bot.db_query('DELETE FROM tiktok_seen WHERE source_id = ?', (src_id,))
+        bot.db_query('DELETE FROM tiktok_sources WHERE source_id = ?', (src_id,))
+
+
+def test_check_now_button_reports_a_failed_check(bot, monkeypatch):
+    """The manual Check now button must surface a failed check, not 'nothing new'."""
+    bot.ensure_user(UID, "pytest-limits")
+    src_id = bot.add_source(UID, "checkhandle", "https://www.tiktok.com/@checkhandle",
+                            "chan-1")
+    sends = []
+    monkeypatch.setattr(bot.bot, "answer_callback_query", lambda *a, **k: None)
+    monkeypatch.setattr(bot.bot, "send_message",
+                        lambda chat_id, text, **k: sends.append(text))
+
+    class ImmediateThread:
+        """Run the handler's worker inline so the assertion sees its message."""
+
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    monkeypatch.setattr(bot.threading, "Thread", ImmediateThread)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("TikTok blocked this IP")
+
+    monkeypatch.setattr(bot, "list_profile_videos", boom)
+    call = SimpleNamespace(
+        id="cb", data=f"tk_check:{src_id}",
+        from_user=SimpleNamespace(id=UID),
+        message=SimpleNamespace(chat=SimpleNamespace(id=UID), message_id=1),
+    )
+    try:
+        bot.cb_tk_check(call)
+        assert sends, "the check button must answer even when the check failed"
+        assert "the check failed" in sends[-1]
+        assert "checkhandle" in sends[-1]
+
+        # A working check with nothing new says so, without the error banner.
+        monkeypatch.setattr(bot, "list_profile_videos", lambda *_a, **_k: [])
+        sends.clear()
+        bot.cb_tk_check(call)
+        assert "nothing new" in sends[-1]
+        assert "the check failed" not in sends[-1]
     finally:
         bot.db_query('DELETE FROM tiktok_seen WHERE source_id = ?', (src_id,))
         bot.db_query('DELETE FROM tiktok_sources WHERE source_id = ?', (src_id,))
