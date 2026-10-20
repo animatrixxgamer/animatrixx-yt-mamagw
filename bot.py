@@ -660,6 +660,15 @@ TIKTOK_MAX_PER_RUN = int(os.environ.get("TIKTOK_MAX_PER_RUN", 3))
 # Background loops
 SCHEDULER_TICK_SECONDS = int(os.environ.get("SCHEDULER_TICK_SECONDS", 30))
 MAX_JOB_RETRIES = int(os.environ.get("MAX_JOB_RETRIES", 3))
+# One notice per problem, not one per attempt: a dead TikTok source would
+# otherwise message its owner every poll interval (default 15 min) forever.
+NOTIFY_COOLDOWN_SECONDS = int(os.environ.get("NOTIFY_COOLDOWN_SECONDS", 24 * 3600))
+# YouTube's default quota is 10,000 units/day and one video insert costs
+# ~1,600 units. Rather than burn every retry (and every notification)
+# against a limit Google will not lift today, the bot parks the job until
+# the quota resets at midnight Pacific and says so once per window.
+YT_DAILY_UPLOAD_UNITS = int(os.environ.get("YT_DAILY_UPLOAD_UNITS", 10000))
+YT_UPLOAD_COST_UNITS = int(os.environ.get("YT_UPLOAD_COST_UNITS", 1600))
 
 # Brand
 BRAND = "YouTube Bot"
@@ -801,6 +810,12 @@ def init_db():
     })
     _ensure_columns(conn, "tiktok_sources", {
         "credit_source": "INTEGER",
+        # Error-dedup state for the poll loop: the last error that was
+        # actually announced, and when. Updated on ANNOUNCE (not on every
+        # failure) so the 24h reminder can still fire while every
+        # 15-minute retry stays silent.
+        "last_error_key": "TEXT",
+        "last_error_at": "TEXT",
     })
 
     if OWNER_ID:
@@ -1694,8 +1709,12 @@ def health_summary_html(uid: int = 0) -> str:
         lines.append("📺 Channels: none connected")
     # Real quota is only visible in the Cloud console, so this is the upload count
     # against the well-known ~1,600 units one video insert costs.
-    lines.append(f"📊 Uploads (24h): {done_today} · "
-                 f"~{done_today * 1600:,} of 10,000 API units")
+    paused = get_setting("quota_paused_until")
+    if paused:
+        lines.append(f"⏳ Quota exhausted — uploads resume {fmt_when(paused)}")
+    lines.append(f"📊 Uploads today: {done_today} · "
+                 f"~{done_today * YT_UPLOAD_COST_UNITS:,} of "
+                 f"{YT_DAILY_UPLOAD_UNITS:,} API units")
     lines.append(f"📥 Queue: {jobs.get('pending', 0)} ready · "
                  f"{jobs.get('scheduled', 0)} scheduled · "
                  f"{jobs.get('uploading', 0)} uploading")
@@ -1773,6 +1792,7 @@ def storage_sweep_once() -> int:
                 removed += 1
         except OSError:
             continue
+    set_setting("last_sweep_at", datetime.utcnow().isoformat())
     if removed:
         print(f"[storage] swept {removed} stale download(s)")
     return removed
@@ -3204,6 +3224,72 @@ def notify(uid: int, text: str, kb=None) -> None:
         pass
 
 
+# ── YouTube quota & notification throttling ─────────────────────────
+
+QUOTA_ERROR_MARKERS = ("quotaexceeded", "dailylimitexceeded", "uploadlimitexceeded",
+                       "ratelimitexceeded", "quota exceeded", "daily limit exceeded",
+                       "upload limit exceeded", "exceeded your daily limit")
+
+
+def is_quota_error(message: str) -> bool:
+    """True when an upload failure means the API quota ran out today.
+
+    Google answers a spent quota with HTTP 403 and a reason code like
+    ``quotaExceeded``; the code only survives in the exception text, so the
+    message is the one reliable signal.
+    """
+    blob = str(message or "").lower()
+    return any(marker in blob for marker in QUOTA_ERROR_MARKERS)
+
+
+def quota_reset_at(now: Optional[datetime] = None) -> datetime:
+    """The next midnight in Pacific time — when Google refills the quota."""
+    now = now or datetime.utcnow()
+    try:
+        from zoneinfo import ZoneInfo
+        local = now.replace(tzinfo=UTC).astimezone(ZoneInfo("America/Los_Angeles"))
+        reset = local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        return reset.astimezone(UTC).replace(tzinfo=None)
+    except Exception:
+        # No tz database on this host — UTC midnight still bounds the wait.
+        return now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+
+def uploads_since(boundary_iso: str) -> int:
+    """Completed uploads at or after a timestamp (the daily-budget meter)."""
+    return length_or_zero(db_query(
+        "SELECT COUNT(*) FROM upload_jobs WHERE status = 'completed' "
+        "AND completed_at >= ?", (boundary_iso,), fetch=True))
+
+
+def quota_budget_left() -> int:
+    """Uploads still allowed today before the daily unit budget is spent."""
+    reset = quota_reset_at()
+    used = uploads_since((reset - timedelta(days=1)).isoformat())
+    return max(0, YT_DAILY_UPLOAD_UNITS // max(1, YT_UPLOAD_COST_UNITS) - used)
+
+
+def notify_quota_parked(resume_iso: str) -> None:
+    """One quota message per window per user, never one per parked job."""
+    window = resume_iso[:10]
+    rows = db_query('SELECT DISTINCT user_id FROM upload_jobs '
+                    'WHERE status = "scheduled" AND error_msg LIKE "quota%"',
+                    fetch=True) or []
+    videos = YT_DAILY_UPLOAD_UNITS // max(1, YT_UPLOAD_COST_UNITS)
+    for (raw_uid,) in rows:
+        uid = int(raw_uid)
+        key = f"quota_notice:{window}:{uid}"
+        if get_setting(key):
+            continue
+        set_setting(key, datetime.utcnow().isoformat())
+        notify(uid,
+               f"⏳ <b>YouTube daily quota reached</b>\n\n"
+               f"Google allows this project ~{YT_DAILY_UPLOAD_UNITS:,} API units/day "
+               f"(about {videos} videos). Queued uploads wait on the shelf instead "
+               f"of failing, and resume automatically when the quota resets at "
+               f"{fmt_when(resume_iso)}.")
+
+
 def run_job_upload(job_id: int, quiet: bool = False) -> bool:
     """Upload a queued job to YouTube. Returns True when it succeeded."""
     job = get_job(job_id)
@@ -3265,6 +3351,18 @@ def run_job_upload(job_id: int, quiet: bool = False) -> bool:
         db_query('UPDATE upload_jobs SET file_path = ? WHERE job_id = ?',
                  (file_path, job_id))
 
+    # Daily-budget guard: with the default quota only a handful of videos fit
+    # per day. Stop BEFORE Google starts refusing so the user gets one clear
+    # notice instead of a wall of 403s.
+    if quota_budget_left() <= 0:
+        resume = quota_reset_at().isoformat()
+        db_query('UPDATE upload_jobs SET status = "scheduled", error_msg = ?, '
+                 'scheduled_at = ? WHERE job_id = ?',
+                 (f"quota: daily limit reached, waiting for {resume}", resume, job_id))
+        set_setting("quota_paused_until", resume)
+        notify_quota_parked(resume)
+        return False
+
     with UPLOAD_LOCK:
         db_query('UPDATE upload_jobs SET status = "uploading", progress = 0, error_msg = NULL '
                  'WHERE job_id = ?', (job_id,))
@@ -3305,14 +3403,40 @@ def run_job_upload(job_id: int, quiet: bool = False) -> bool:
         except Exception as exc:
             attempts = int(job_field(job, "retries") or 0) + 1
             message = str(exc)[:400]
+            blob = message.lower()
+
+            # Dead token: retrying cannot fix it and mark_channel_revoked has
+            # already told the owner once (per grant). Fail immediately so a
+            # revoked channel can never spam one message per job per retry.
+            if any(marker in blob for marker in TOKEN_FAILURE_MARKERS):
+                db_query('UPDATE upload_jobs SET status = "failed", retries = ?, error_msg = ? '
+                         'WHERE job_id = ?', (attempts, message, job_id))
+                mark_channel_revoked(uid, str(channel_id or ""), "revoked")
+                return False
+
+            # Quota spent: park the job until Google refills it instead of
+            # retrying into the same wall, and say so once per window.
+            if is_quota_error(message):
+                resume = quota_reset_at().isoformat()
+                db_query('UPDATE upload_jobs SET status = "scheduled", retries = ?, '
+                         'error_msg = ?, scheduled_at = ? WHERE job_id = ?',
+                         (attempts, f"quota: daily limit reached, waiting for {resume}",
+                          resume, job_id))
+                set_setting("quota_paused_until", resume)
+                notify_quota_parked(resume)
+                return False
+
             if attempts < MAX_JOB_RETRIES:
                 retry_at = (datetime.utcnow() + timedelta(minutes=2 ** attempts)).isoformat()
                 db_query('UPDATE upload_jobs SET status = "scheduled", retries = ?, error_msg = ?, '
                          'scheduled_at = ? WHERE job_id = ?',
                          (attempts, message, retry_at, job_id))
-                notify(uid, f"⚠️ Upload #{job_id} failed (attempt {attempts}/{MAX_JOB_RETRIES}):\n"
-                            f"<code>{escape(message)}</code>\n\n"
-                            f"🔁 Retrying automatically at {fmt_when(retry_at)}")
+                # Only the FIRST failed attempt announces; a queue of 30 jobs
+                # hitting the same transient error is one message, not 30+30+30.
+                if attempts == 1:
+                    notify(uid, f"⚠️ Upload #{job_id} failed (attempt {attempts}/{MAX_JOB_RETRIES}):\n"
+                                f"<code>{escape(message)}</code>\n\n"
+                                f"🔁 Retrying automatically at {fmt_when(retry_at)}")
             else:
                 db_query('UPDATE upload_jobs SET status = "failed", retries = ?, error_msg = ? '
                          'WHERE job_id = ?', (attempts, message, job_id))
@@ -3324,6 +3448,8 @@ def run_job_upload(job_id: int, quiet: bool = False) -> bool:
                  'completed_at = ?, error_msg = NULL WHERE job_id = ?',
                  (result["video_id"], datetime.utcnow().isoformat(), job_id))
         audit(uid, "youtube_upload", f"job={job_id} video={result['video_id']}")
+        # A landing upload proves the quota is flowing again.
+        set_setting("quota_paused_until", "")
 
         # A thumbnail attached earlier (photo message) is applied now.
         thumb_row = db_query('SELECT thumb_path FROM upload_jobs WHERE job_id = ?',
@@ -3372,6 +3498,17 @@ def upload_worker_loop() -> None:
     print("[worker] upload worker started")
     while True:
         try:
+            # Quota exhausted: every pending upload would fail the same way
+            # until the reset, so the whole drain waits. Parked jobs carry a
+            # scheduled_at past the reset, so nothing is lost.
+            paused = get_setting("quota_paused_until")
+            if paused:
+                try:
+                    if datetime.fromisoformat(paused) > datetime.utcnow():
+                        time.sleep(SCHEDULER_TICK_SECONDS)
+                        continue
+                except ValueError:
+                    pass
             promote_due_jobs()
             # file_path may be '' for link-only jobs (auto-post / pasted links)
             # that still have to be downloaded at upload time.
@@ -3391,6 +3528,26 @@ def upload_worker_loop() -> None:
 #  TIKTOK -> YOUTUBE AUTO POSTING
 # ═════════════════════════════════════════════════════════════════
 
+def source_error_is_new(cells: dict, message: str, now: datetime) -> bool:
+    """Announce a TikTok check failure only when it is new or long-stale.
+
+    The watcher polls every source on a timer; announcing every failure turns
+    one broken handle into a message every poll interval, forever. A failure
+    is announced when its text differs from the last ANNOUNCED error, or when
+    that same error has been silent for NOTIFY_COOLDOWN_SECONDS (reminder).
+    """
+    if message != str(cells.get("last_error_key") or ""):
+        return True
+    last_at = str(cells.get("last_error_at") or "")
+    if not last_at:
+        return True
+    try:
+        age = (now - datetime.fromisoformat(last_at)).total_seconds()
+    except ValueError:
+        return True
+    return age >= NOTIFY_COOLDOWN_SECONDS
+
+
 def poll_source(source_id: int, announce: bool = True) -> int:
     """Check one source and queue any new TikTok videos. Returns job count."""
     raw = get_source(int(source_id))
@@ -3399,7 +3556,8 @@ def poll_source(source_id: int, announce: bool = True) -> int:
     cells = dict(zip(
         ["source_id", "user_id", "handle", "profile_url", "channel_id", "privacy_status",
          "enabled", "interval_seconds", "max_per_run", "stagger_minutes", "title_template",
-         "last_check", "last_status", "created_at", "credit_source"], raw))
+         "last_check", "last_status", "created_at", "credit_source",
+         "last_error_key", "last_error_at"], raw))
     uid = int(cells["user_id"])
     handle = cells["handle"] or ""
     channel_id = cells["channel_id"]
@@ -3411,9 +3569,17 @@ def poll_source(source_id: int, announce: bool = True) -> int:
     try:
         videos = list_profile_videos(profile_url, limit=max(10, max_per_run * 3))
     except Exception as exc:
+        now = datetime.utcnow()
+        message = str(exc)[:180]
         db_query('UPDATE tiktok_sources SET last_check = ?, last_status = ? WHERE source_id = ?',
-                 (datetime.utcnow().isoformat(), f"error: {str(exc)[:180]}", int(source_id)))
-        if announce:
+                 (now.isoformat(), f"error: {message}", int(source_id)))
+        # Announce only when the error is NEW, or the same error has been
+        # silent for NOTIFY_COOLDOWN_SECONDS. Without this the watcher
+        # messages its owner every poll interval, forever — the single
+        # biggest source of chat spam in this bot.
+        if announce and source_error_is_new(cells, message, now):
+            db_query('UPDATE tiktok_sources SET last_error_key = ?, last_error_at = ? '
+                     'WHERE source_id = ?', (message, now.isoformat(), int(source_id)))
             notify(uid, f"⚠️ TikTok check failed for @{escape(handle)}:\n"
                         f"<code>{escape(str(exc)[:300])}</code>\n\n"
                         f"{cookies_file_hint()}\n"
@@ -3471,9 +3637,15 @@ def poll_source(source_id: int, announce: bool = True) -> int:
                     f"📋 Job #{job_id} queued — downloads automatically at upload time"
                     + (f"\n🗓 Scheduled: {fmt_when(publish_at)}" if publish_at else ""))
 
-    db_query('UPDATE tiktok_sources SET last_check = ?, last_status = ? WHERE source_id = ?',
+    db_query('UPDATE tiktok_sources SET last_check = ?, last_status = ?, '
+             'last_error_key = NULL, last_error_at = NULL WHERE source_id = ?',
              (datetime.utcnow().isoformat(),
               f"ok: {queued} new" if queued else "ok: nothing new", source_id))
+    # The check works again — say so once, so "TikTok check failed" never
+    # stands forever with no follow-up.
+    if announce and str(cells.get("last_status") or "").startswith("error"):
+        notify(uid, f"✅ TikTok check for @{escape(handle)} is working again"
+                    + (f" — {queued} new video(s) queued." if queued else "."))
     return queued
 
 
@@ -4150,6 +4322,7 @@ def admin_kb() -> types.InlineKeyboardMarkup:
     kb.add(Btn(f"{G['diag']}  Diagnostics", callback_data="adm_diag", style="primary"),
         Btn("📺  Subscribe all channels", callback_data="adm_suball", style="success"),
     )
+    kb.add(Btn("🏠  Hosting Panel", callback_data="hosting", style="success"))
     kb.add(Btn(f"{G['back']}  Main Menu", callback_data="main_menu", style="danger"))
     return kb
 
@@ -4354,6 +4527,17 @@ def cmd_diag(message):
         bot.reply_to(message, "⚠️ Admin only.")
         return
     bot.reply_to(message, diag_text(), disable_web_page_preview=True)
+
+
+@bot.message_handler(commands=['hosting', 'railway'])
+def cmd_hosting(message):
+    """Hosting dashboard: server health and controls, no Railway UI needed."""
+    uid = message.from_user.id
+    if not is_admin(uid):
+        bot.reply_to(message, "⚠️ Admin only.")
+        return
+    bot.reply_to(message, hosting_text(), reply_markup=hosting_kb(),
+                 disable_web_page_preview=True)
 
 
 @bot.message_handler(commands=['oauthcheck', 'oauth_check', 'oauth-self-check'])
@@ -6308,12 +6492,24 @@ def cb_tk_check(call):
 
     def worker():
         total = 0
+        errors = []
         for source_id in ids:
             total += poll_source(source_id, announce=False)
-        safe_send(call.message.chat.id,
-                  f"🎵 Check finished — {total} new video(s) queued." if total else
-                  "🎵 Check finished — nothing new.",
-                  tk_kb(uid))
+            # A manual check must REPORT a failed check — "nothing new" when
+            # TikTok actually refused the request hides the real problem.
+            src = get_source(source_id)
+            status = str((src[12] if src and len(src) > 12 else "") or "")
+            if src and status.startswith("error"):
+                errors.append(f"@{(src[2] or '?')}: {status[6:][:150]}")
+        if total:
+            text = f"🎵 Check finished — {total} new video(s) queued."
+        elif errors:
+            text = ("🎵 Check finished — <b>the check failed</b>:\n\n"
+                    + "\n".join(f"• {escape(e)}" for e in errors)
+                    + f"\n\n{cookies_file_hint()}")
+        else:
+            text = "🎵 Check finished — nothing new."
+        safe_send(call.message.chat.id, text, tk_kb(uid))
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -6819,6 +7015,196 @@ def cb_adm_diag(call):
         return
     safe_answer(call)
     safe_edit(call, diag_text(), admin_kb())
+
+
+# ═════════════════════════════════════════════════════════════════
+#  HOSTING PANEL — manage the server from the chat (Railway, VPS…)
+# ═════════════════════════════════════════════════════════════════
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    try:
+        for f in path.rglob("*"):
+            try:
+                if f.is_file():
+                    total += f.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return total
+
+
+def _human_bytes(n: float) -> str:
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{int(n)} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _process_memory_bytes() -> int:
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, IndexError, ValueError):
+        pass
+    return 0
+
+
+def hosting_text() -> str:
+    """Server health an admin can act on without opening the Railway dashboard."""
+    try:
+        disk = shutil.disk_usage(str(STORAGE_DIR))
+        pct_free = (disk.free * 100) // max(1, disk.total)
+        disk_line = (f"💾 Disk: {_human_bytes(disk.total - disk.free)} used of "
+                     f"{_human_bytes(disk.total)} ({pct_free}% free)")
+    except OSError:
+        disk_line = "💾 Disk: unavailable"
+    last_sweep = get_setting("last_sweep_at")
+    sweep_line = "never" if not last_sweep else fmt_when(last_sweep)
+    paused = get_setting("quota_paused_until")
+    quota_line = (f"⏳ Quota exhausted — resumes {fmt_when(paused)}" if paused
+                  else f"✅ Quota: {quota_budget_left()} upload(s) left today")
+    uptime_min = int((time.time() - START_TIME) // 60)
+    jobs = job_counts_by_status()
+    on_railway = bool(os.environ.get("RAILWAY_ENVIRONMENT")
+                      or os.environ.get("RAILWAY_PROJECT_ID"))
+    lines = [
+        "🏠 <b>Hosting panel</b>" + (" · Railway" if on_railway else ""),
+        "",
+        f"⏱ Uptime: {uptime_min // 60}h {uptime_min % 60}m",
+        f"🧵 RAM: {_human_bytes(_process_memory_bytes())} · Uploads: "
+        f"{'busy' if UPLOAD_LOCK.locked() else 'idle'}",
+        disk_line,
+        f"📦 Storage: {_human_bytes(_dir_size_bytes(STORAGE_DIR))} "
+        f"(auto-clean after {STORAGE_KEEP_HOURS}h)",
+        f"🧹 Last cleanup: {escape(str(sweep_line))}",
+        "",
+        quota_line,
+        f"📥 Queue: {jobs.get('pending', 0)} ready · {jobs.get('scheduled', 0)} scheduled · "
+        f"{jobs.get('failed', 0)} failed · ✅ {jobs.get('completed', 0)} done",
+        f"🍪 Cookies: {'found' if os.path.isfile(SOCIAL_COOKIES_FILE) else 'missing — send /cookies'}",
+        f"🎞 ffmpeg: {'found' if shutil.which('ffmpeg') else 'missing'}",
+        "",
+        "<i>Everything here works from chat — no Railway dashboard needed.</i>",
+    ]
+    return "\n".join(lines)
+
+
+def hosting_kb() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(Btn(f"{G['refresh']}  Refresh", callback_data="hosting", style="primary"),
+           Btn(f"{G['trash']}  Clean storage now", callback_data="host_sweep", style="success"))
+    kb.add(Btn(f"{G['doc']}  Backup database", callback_data="host_backup", style="primary"),
+           Btn(f"{G['graph']}  Health summary", callback_data="host_health", style="primary"))
+    kb.add(Btn(f"{G['diag']}  Diagnostics", callback_data="adm_diag", style="primary"),
+           Btn(f"{G['settings']}  Bot Settings", callback_data="adm_bot_settings", style="primary"))
+    kb.add(Btn(f"{G['refresh']}  Restart bot", callback_data="host_restart", style="danger"))
+    kb.add(Btn(f"{G['back']}  Admin", callback_data="admin_panel", style="danger"))
+    return kb
+
+
+def backup_database() -> str:
+    """Copy the SQLite database into storage/backups; keep the newest 7."""
+    try:
+        backup_dir = STORAGE_DIR / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        dest = backup_dir / f"bot-{stamp}.db"
+        src_conn = sqlite3.connect(str(DB_FILE))
+        dst_conn = sqlite3.connect(str(dest))
+        with dst_conn:
+            src_conn.backup(dst_conn)
+        src_conn.close()
+        dst_conn.close()
+        for stale in sorted(backup_dir.glob("bot-*.db"))[:-7]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        return (f"🗄 <b>Database backed up</b>\n\n<code>{escape(str(dest))}</code>\n"
+                f"Size: {_human_bytes(dest.stat().st_size)} · newest 7 kept")
+    except Exception as exc:
+        return f"❌ Backup failed: <code>{escape(str(exc)[:200])}</code>"
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "hosting")
+def cb_hosting(call):
+    if not is_admin(call.from_user.id):
+        safe_answer(call, "Admin only.", alert=True)
+        return
+    safe_answer(call)
+    safe_edit(call, hosting_text(), hosting_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "host_sweep")
+def cb_host_sweep(call):
+    if not is_admin(call.from_user.id):
+        safe_answer(call, "Admin only.", alert=True)
+        return
+    safe_answer(call, "Cleaning storage…")
+
+    def worker():
+        try:
+            removed = storage_sweep_once()
+        except Exception as exc:
+            safe_send(call.message.chat.id, f"❌ Cleanup failed: {escape(str(exc)[:200])}",
+                      hosting_kb())
+            return
+        safe_send(call.message.chat.id,
+                  f"🧹 Cleanup finished — {removed} stale file(s) removed.", hosting_kb())
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "host_backup")
+def cb_host_backup(call):
+    if not is_admin(call.from_user.id):
+        safe_answer(call, "Admin only.", alert=True)
+        return
+    safe_answer(call)
+    safe_edit(call, backup_database(), hosting_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "host_health")
+def cb_host_health(call):
+    if not is_admin(call.from_user.id):
+        safe_answer(call, "Admin only.", alert=True)
+        return
+    safe_answer(call)
+    safe_send(call.message.chat.id, health_summary_html(), hosting_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "host_restart")
+def cb_host_restart(call):
+    if not is_admin(call.from_user.id):
+        safe_answer(call, "Admin only.", alert=True)
+        return
+    safe_answer(call)
+    safe_edit(call, "♻️ <b>Restart the bot process?</b>\n\n"
+                    "The service restarts in a few seconds; nothing is lost "
+                    "(all state lives in the database and the volume).",
+              confirm_kb("host_restart_go", "hosting"))
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "host_restart_go")
+def cb_host_restart_go(call):
+    if not is_admin(call.from_user.id):
+        safe_answer(call, "Admin only.", alert=True)
+        return
+    safe_answer(call, "Restarting…")
+    try:
+        safe_edit(call, "♻️ Restarting — send /start in a moment.", hosting_kb())
+    except Exception:
+        pass
+    audit(call.from_user.id, "bot_restart", "hosting panel")
+    # Re-exec the same interpreter: on Railway/Koyeb/etc. that is a clean
+    # process restart without touching the dashboard or a shell.
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 # ═════════════════════════════════════════════════════════════════

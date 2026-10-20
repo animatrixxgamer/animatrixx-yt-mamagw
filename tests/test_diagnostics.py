@@ -342,8 +342,8 @@ class TestHealthSummary:
         text = bot.health_summary_html(USER_A)
         assert "1 connected" in text
         assert "1 need reconnecting" in text
-        assert "Uploads (24h): 1" in text
-        assert "1,600 of 10,000 API units" in text
+        assert "Uploads today: 1" in text
+        assert "~1,600 of 10,000 API units" in text
         assert "1 ready" in text
         assert "1 scheduled" in text
         assert "Failed: 1" in text

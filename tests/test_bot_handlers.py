@@ -208,6 +208,11 @@ def test_every_menu_payload_runs(bot, monkeypatch):
         ("adm_set_free", CHAT_ID),
         ("adm_audit", CHAT_ID),
         ("adm_diag", CHAT_ID),
+        ("hosting", CHAT_ID),
+        ("host_sweep", CHAT_ID),
+        ("host_backup", CHAT_ID),
+        ("host_health", CHAT_ID),
+        ("host_restart", CHAT_ID),  # shows the confirm dialog only
         (f"adm_user:{JOB_UID}", CHAT_ID),
         (f"adm_ban_user:{JOB_UID}", CHAT_ID),
         (f"adm_unban_user:{JOB_UID}", CHAT_ID),
