@@ -8491,6 +8491,57 @@ def handle_text(message):
                  "• /queue or /menu to find your way around")
 
 
+def install_project_deps(user_folder):
+    """Install what an uploaded project actually declares (best effort).
+
+    requirements.txt first (what Python projects ship), else a pyproject /
+    setup.py package via `pip install .`, then npm for package.json. Every
+    step is bounded by a timeout: a broken dependency list must never hang
+    the bot or crash the upload flow. Returns a short HTML note describing
+    exactly what happened, so the user is never left guessing.
+    """
+    notes = []
+
+    def _pip(args, ok, fail, cwd=None):
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", *args],
+                capture_output=True, text=True, timeout=300, cwd=cwd)
+        except subprocess.TimeoutExpired:
+            notes.append("⚠️ pip timed out (5 min limit)")
+            return
+        except Exception as exc:
+            notes.append(f"⚠️ pip error: {escape(str(exc)[:150])}")
+            return
+        if proc.returncode == 0:
+            notes.append(ok)
+        else:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            notes.append(f"{fail}: <code>{escape(' | '.join(tail[-2:])[:300])}</code>")
+
+    req = user_folder / "requirements.txt"
+    if req.is_file():
+        _pip(["-r", str(req)], "📦 requirements.txt installed",
+             "⚠️ pip could not install requirements.txt")
+    elif (user_folder / "pyproject.toml").is_file() or (user_folder / "setup.py").is_file():
+        _pip(["."], "📦 package installed", "⚠️ pip install . failed",
+             cwd=str(user_folder))
+
+    pkg = user_folder / "package.json"
+    if pkg.is_file() and shutil.which("npm"):
+        try:
+            proc = subprocess.run(["npm", "install", "--omit=dev"],
+                                  cwd=str(user_folder), capture_output=True,
+                                  text=True, timeout=300)
+            notes.append("📦 npm packages installed" if proc.returncode == 0
+                         else "⚠️ npm install failed (check package.json)")
+        except subprocess.TimeoutExpired:
+            notes.append("⚠️ npm install timed out (5 min limit)")
+
+    return "\n".join(f"• {n}" for n in notes) or \
+        "• no requirements.txt found — nothing to install"
+
+
 def handle_file_upload(message):
     uid = message.from_user.id
     doc = message.document
@@ -8638,28 +8689,79 @@ def handle_file_upload(message):
             f"📦 Extracting and installing dependencies...",
             message.chat.id, msg.message_id)
 
-        # Extract ZIP
+        # Extract the whole project, install what it declares, offer Run.
         def extract_and_run():
             try:
                 extract_dir = user_folder / "extracted"
-                extract_dir.mkdir(exist_ok=True)
+                if extract_dir.exists():
+                    shutil.rmtree(extract_dir)
+                extract_dir.mkdir(parents=True)
 
+                base = extract_dir.resolve()
                 with zipfile.ZipFile(file_path, 'r') as z:
+                    # Refuse zip-slip: no entry may land outside this folder.
+                    for member in z.infolist():
+                        target = (base / member.filename).resolve()
+                        if target != base and not str(target).startswith(str(base) + os.sep):
+                            raise ValueError(f"unsafe path in zip: {member.filename}")
                     z.extractall(extract_dir)
 
-                # Find main script
-                for script in ['main.py', 'bot.py', 'app.py', 'index.js', 'bot.js']:
-                    script_path = extract_dir / script
-                    if script_path.exists():
-                        # Move to user folder
-                        shutil.move(str(script_path), str(user_folder / script))
-                        bot.send_message(message.chat.id,
-                            f"✅ Extracted! Main script: <b>{script}</b>")
+                script_names = ('main.py', 'bot.py', 'app.py', 'index.js', 'bot.js')
+                root = extract_dir
+                # Unwrap GitHub-style wrapper folders: descend while there is
+                # exactly one folder, no loose files, and no script yet.
+                for _ in range(5):
+                    if any((root / n).is_file() for n in script_names):
+                        break
+                    kids = list(root.iterdir())
+                    loose_files = [e for e in kids if e.is_file()]
+                    dirs = [e for e in kids if e.is_dir()]
+                    if not loose_files and len(dirs) == 1:
+                        root = dirs[0]
+                    else:
                         break
 
-                # Cleanup
-                shutil.rmtree(extract_dir)
+                # Keep EVERYTHING the zip ships (helper modules, configs,
+                # data files, requirements.txt). The old version moved only
+                # the main script and deleted the rest - which alone broke
+                # most real projects.
+                for item in root.iterdir():
+                    if item.name == "__MACOSX":
+                        continue
+                    dest = user_folder / item.name
+                    if item.is_dir():
+                        if dest.exists():
+                            shutil.rmtree(dest)
+                        shutil.copytree(item, dest)
+                    else:
+                        shutil.move(str(item), str(dest))
+                shutil.rmtree(extract_dir, ignore_errors=True)
 
+                main_script = next(
+                    (n for n in script_names if (user_folder / n).is_file()), "")
+                dep_note = install_project_deps(user_folder)
+                if not main_script:
+                    bot.send_message(
+                        message.chat.id,
+                        "✅ Extracted, but no main script found "
+                        "(looked for <code>main.py</code>, <code>bot.py</code>, "
+                        "<code>app.py</code>, <code>index.js</code>, "
+                        f"<code>bot.js</code>).\n{dep_note}")
+                    return
+
+                kb = types.InlineKeyboardMarkup(row_width=2)
+                kb.add(
+                    Btn(f"{G['play']}  Run Now",
+                        callback_data=f"run_file:{uid}:{main_script}", style="success"),
+                    Btn(f"{G['doc']}  Logs",
+                        callback_data=f"logs:{uid}:{main_script}", style="primary"),
+                )
+                kb.add(Btn(f"{G['back']}  Back", callback_data="host_files",
+                           style="danger"))
+                bot.send_message(
+                    message.chat.id,
+                    f"✅ Extracted! Main script: <b>{main_script}</b>\n{dep_note}",
+                    reply_markup=kb)
             except Exception as e:
                 bot.send_message(message.chat.id, f"❌ Extract error: {str(e)}")
 

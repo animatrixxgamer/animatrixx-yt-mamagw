@@ -10,7 +10,10 @@ These tests pin the fixed behaviour:
 * a revoked token fails a job immediately instead of retrying with a
   notification per attempt,
 * the daily upload budget stops work before Google starts refusing,
-* the hosting panel renders for admins.
+* the hosting panel renders for admins,
+* a zip upload keeps every extracted file, pip-installs requirements.txt
+  and offers a Run button (the old flow deleted everything but the main
+  script and installed nothing).
 """
 
 import importlib.util
@@ -321,6 +324,166 @@ def test_hosting_backup_creates_and_prunes(bot, tmp_path, monkeypatch):
     text = bot.backup_database()
     assert "backed up" in text.lower()
     assert len(list(backup_dir.glob("bot-*.db"))) == 7  # newest kept, oldest gone
+
+
+# ── zip upload runner: keep files, install requirements, offer Run ──
+
+def _make_zip(entries) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, content in entries.items():
+            z.writestr(name, content)
+    return buf.getvalue()
+
+
+class _ImmediateThread:
+    """Run the handler's worker inline so assertions see its messages."""
+
+    def __init__(self, target=None, daemon=None):
+        self._target = target
+
+    def start(self):
+        if self._target:
+            self._target()
+
+
+def _upload_zip(bot, monkeypatch, tmp_path, entries, fname="proj.zip"):
+    """Drive handle_file_upload end-to-end against a fake Telegram API.
+
+    Isolated in tmp_path, so the real storage folder is never touched, and
+    pip is stubbed, so no network access happens.
+    """
+    import subprocess as real_subprocess
+
+    owner = bot.OWNER_ID
+    zip_bytes = _make_zip(entries)
+    doc = SimpleNamespace(file_name=fname, file_id="fid-zip",
+                          file_size=len(zip_bytes))
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=owner, username="pytest"),
+        document=doc, chat=SimpleNamespace(id=UID))
+
+    monkeypatch.setattr(bot, "STORAGE_DIR", tmp_path)
+    sends = []   # (text, reply_markup)
+    pip_calls = []
+    monkeypatch.setattr(bot.bot, "reply_to",
+                        lambda m, text, **k: SimpleNamespace(message_id=1))
+    monkeypatch.setattr(bot.bot, "edit_message_text", lambda *a, **k: None)
+    monkeypatch.setattr(bot.bot, "get_file",
+                        lambda fid: SimpleNamespace(file_path="tg/fake.zip"))
+    monkeypatch.setattr(bot.bot, "download_file", lambda path: zip_bytes)
+    monkeypatch.setattr(
+        bot.bot, "send_message",
+        lambda chat_id, text, **k: sends.append((text, k.get("reply_markup"))))
+    monkeypatch.setattr(bot.threading, "Thread", _ImmediateThread)
+
+    def fake_run(cmd, **kw):
+        pip_calls.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        bot, "subprocess",
+        SimpleNamespace(run=fake_run, TimeoutExpired=real_subprocess.TimeoutExpired))
+
+    bot.db_query(
+        "DELETE FROM user_files WHERE user_id = ? AND file_name = ?", (owner, fname))
+    try:
+        bot.handle_file_upload(message)
+        return SimpleNamespace(sends=sends, pip_calls=pip_calls,
+                               folder=tmp_path / "uploads" / str(owner))
+    finally:
+        bot.db_query(
+            "DELETE FROM user_files WHERE user_id = ? AND file_name = ?", (owner, fname))
+
+
+def test_zip_keeps_all_files_installs_requirements_and_offers_run(
+        bot, monkeypatch, tmp_path):
+    result = _upload_zip(bot, monkeypatch, tmp_path, {
+        "main.py": "import requests\nprint('hi')\n",
+        "helper.py": "def assist():\n    return 1\n",
+        "requirements.txt": "requests==2.32.0\n",
+    })
+    folder = result.folder
+
+    # Everything the zip shipped survives extraction. The old flow kept only
+    # the main script and deleted the rest (helper.py, requirements.txt, ...).
+    assert (folder / "main.py").is_file()
+    assert (folder / "helper.py").is_file()
+    assert (folder / "requirements.txt").is_file()
+
+    # requirements.txt was actually handed to pip.
+    req_path = str(folder / "requirements.txt")
+    assert any("-r" in cmd and req_path in cmd for cmd in result.pip_calls), \
+        result.pip_calls
+
+    # The reply states the result and offers working Run + Logs buttons.
+    finals = [t for t, kb in result.sends if "Extracted!" in t]
+    assert finals, result.sends
+    assert "requirements.txt installed" in finals[-1]
+    kb = [kb for t, kb in result.sends if "Extracted!" in t][-1]
+    callbacks = [b.callback_data for row in kb.keyboard for b in row]
+    assert f"run_file:{bot.OWNER_ID}:main.py" in callbacks
+    assert any(c.startswith("logs:") for c in callbacks)
+
+
+def test_zip_unwraps_github_style_folder(bot, monkeypatch, tmp_path):
+    result = _upload_zip(bot, monkeypatch, tmp_path, {
+        "myrepo-main/main.py": "print('nested')\n",
+        "myrepo-main/lib/util.py": "X = 1\n",
+        "myrepo-main/requirements.txt": "requests\n",
+    }, fname="gh.zip")
+    folder = result.folder
+    assert (folder / "main.py").is_file()
+    assert (folder / "lib" / "util.py").is_file()
+    assert (folder / "requirements.txt").is_file()
+    assert any("-r" in cmd for cmd in result.pip_calls)
+
+
+def test_zip_rejects_paths_outside_the_extract_folder(bot, monkeypatch, tmp_path):
+    result = _upload_zip(bot, monkeypatch, tmp_path, {
+        "../evil.py": "os.system('boom')\n",
+        "main.py": "print('ok')\n",
+    }, fname="evil.zip")
+    assert any("Extract error" in t for t, _kb in result.sends), result.sends
+    # Nothing was extracted at all - not even the legit main.py.
+    assert not (result.folder / "evil.py").exists()
+    assert not (result.folder / "main.py").exists()
+
+
+def test_install_project_deps_notes_success_and_failure(bot, monkeypatch, tmp_path):
+    import subprocess as real_subprocess
+
+    # Nothing declared -> honest note, no subprocess at all.
+    assert "nothing to install" in bot.install_project_deps(tmp_path)
+
+    (tmp_path / "requirements.txt").write_text("requests==2.32.0\n")
+    calls = []
+
+    def failing(cmd, **kw):
+        calls.append(list(cmd))
+        return SimpleNamespace(
+            returncode=1, stdout="",
+            stderr="ERROR: Could not find a version that satisfies the requirement nope")
+
+    monkeypatch.setattr(
+        bot, "subprocess",
+        SimpleNamespace(run=failing, TimeoutExpired=real_subprocess.TimeoutExpired))
+    note = bot.install_project_deps(tmp_path)
+    assert "could not install requirements.txt" in note
+    assert "Could not find a version" in note  # the real pip error is surfaced
+    assert any("-r" in cmd for cmd in calls)
+
+    def ok(cmd, **kw):
+        calls.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        bot, "subprocess",
+        SimpleNamespace(run=ok, TimeoutExpired=real_subprocess.TimeoutExpired))
+    assert "requirements.txt installed" in bot.install_project_deps(tmp_path)
 
 
 def teardown_module(module):
