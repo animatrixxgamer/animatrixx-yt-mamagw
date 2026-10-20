@@ -58,6 +58,7 @@ ping - 🏓 Check bot health
 status - 📊 Your account status
 oauthcheck - 🔧 Why is Connect YouTube failing?
 diag - 🩺 Bot diagnostics (admin)
+hosting - 🏠 Hosting panel: disk, cleanup, backup, restart (admin)
 help - 📖 How to use the bot
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -83,6 +84,7 @@ ping - 🏓 Check bot health
 status - 📊 Your account status
 oauthcheck - 🔧 Why is Connect YouTube failing?
 diag - 🩺 Bot diagnostics (admin)
+hosting - 🏠 Hosting panel: disk, cleanup, backup, restart (admin)
 help - 📖 How to use the bot
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

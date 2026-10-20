@@ -256,6 +256,7 @@ python bot.py
 /cancel                ❌  Cancel current input
 /ping  /status         🏓  Bot health
 /diag                  🧪  Diagnostics (admin)
+/hosting               🏠  Hosting panel: disk, backup, restart (admin)
 ```
 
 ---

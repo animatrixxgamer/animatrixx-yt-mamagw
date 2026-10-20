@@ -155,6 +155,7 @@ Extra guards that ship with this version:
 | `/cancel` | Cancel the current input |
 | `/ping`, `/status` | Bot health / your status |
 | `/diag` | Diagnostics (admins) |
+| `/hosting` | Hosting panel: disk, cleanup, DB backup, restart (admins) |
 
 ## ⚙️ Environment
 

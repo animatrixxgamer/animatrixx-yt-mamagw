@@ -4373,6 +4373,9 @@ HELP_TEXT = (
     "/tiktok — TikTok → YouTube auto posting\n"
     "/cancel — cancel the current input\n"
     "/ping · /status — check the bot\n\n"
+    "<b>Admin</b>\n"
+    "/hosting — server panel: disk, cleanup, backup, restart\n"
+    "/diag · /summary — diagnostics &amp; health\n\n"
     f"Need a hand? {escape(SUPPORT_USR)}"
 )
 
