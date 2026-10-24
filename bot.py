@@ -678,7 +678,7 @@ YT_UPLOAD_COST_UNITS = int(os.environ.get("YT_UPLOAD_COST_UNITS", 1600))
 AI_BASE_URL = os.environ.get(
     "AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
-AI_MODEL = os.environ.get("AI_MODEL", "gemini-2.5-flash")
+AI_MODEL = os.environ.get("AI_MODEL", "gemini-3.5-flash")
 AI_TIMEOUT_SECONDS = int(os.environ.get("AI_TIMEOUT_SECONDS", 90))
 
 # Brand
