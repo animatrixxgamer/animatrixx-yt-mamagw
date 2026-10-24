@@ -210,6 +210,7 @@ def test_every_menu_payload_runs(bot, monkeypatch):
         ("adm_diag", CHAT_ID),
         ("hosting", CHAT_ID),
         ("host_sweep", CHAT_ID),
+        ("ai_coach", JOB_UID),  # free user -> premium gate must answer
         ("host_backup", CHAT_ID),
         ("host_health", CHAT_ID),
         ("host_restart", CHAT_ID),  # shows the confirm dialog only

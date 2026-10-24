@@ -670,6 +670,17 @@ NOTIFY_COOLDOWN_SECONDS = int(os.environ.get("NOTIFY_COOLDOWN_SECONDS", 24 * 360
 YT_DAILY_UPLOAD_UNITS = int(os.environ.get("YT_DAILY_UPLOAD_UNITS", 10000))
 YT_UPLOAD_COST_UNITS = int(os.environ.get("YT_UPLOAD_COST_UNITS", 1600))
 
+# AI coach (optional): an OpenAI-compatible chat endpoint that reads the
+# channel's recent uploads and explains why views are low and when to post.
+# Free setup: create a key at https://aistudio.google.com/apikey (Google AI
+# Studio, no card needed) and set AI_API_KEY. Any OpenAI-compatible service
+# works via AI_BASE_URL + AI_MODEL (defaults target Gemini's compat endpoint).
+AI_BASE_URL = os.environ.get(
+    "AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+AI_API_KEY = os.environ.get("AI_API_KEY", "")
+AI_MODEL = os.environ.get("AI_MODEL", "gemini-2.5-flash")
+AI_TIMEOUT_SECONDS = int(os.environ.get("AI_TIMEOUT_SECONDS", 90))
+
 # Brand
 BRAND = "YouTube Bot"
 SUPPORT_USR = "@animatrixxgamer"
@@ -1109,6 +1120,24 @@ def render_description_template(template: str, *, title: str = "", creator: str 
     return rendered.strip()
 
 
+_PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_ ]*\}")
+_LABEL_ONLY_RE = re.compile(r"^[\W_]*[A-Za-z][A-Za-z \W]*:\s*$")
+
+
+def sanitize_for_youtube(text: str) -> str:
+    """Drop unreplaced {placeholder} tokens and lines they leave dangling.
+
+    A template like "Original creator: {disciplinefuelshortz}" holds a
+    placeholder no renderer ever fills, so the raw braces used to ship to the
+    video page and read like a broken bot. Strip the tokens, then drop any
+    line that is now only a label ("Original creator:") or empty.
+    """
+    cleaned = _PLACEHOLDER_RE.sub("", str(text or ""))
+    lines = [ln for ln in cleaned.splitlines()
+             if ln.strip() and not _LABEL_ONLY_RE.match(ln.strip())]
+    return "\n".join(lines).strip()
+
+
 def build_import_description(uid: int, title: str, creator: str, source_url: str,
                              mark_source: bool = False,
                              credit: Optional[int] = None) -> str:
@@ -1156,10 +1185,10 @@ def build_import_description(uid: int, title: str, creator: str, source_url: str
         # Mark the rendered source line so the job card can strip/restore it.
         # The block holds only what the user sees; restore re-renders from the
         # job's source_url, so toggling never duplicates lines.
-        head = "\n".join(parts[:-1]).strip()
-        marked = f"{SOURCE_SUFFIX_MARK}{parts[-1]}"
+        head = sanitize_for_youtube("\n".join(parts[:-1]))
+        marked = sanitize_for_youtube(f"{SOURCE_SUFFIX_MARK}{parts[-1]}")
         return f"{head}\n\n{marked}" if head else marked
-    return body
+    return sanitize_for_youtube(body)
 
 
 SOURCE_SUFFIX_MARK = "\u200b\U0001f517\u200b"  # zero-width space + 🔗 marker
@@ -2637,6 +2666,37 @@ class YouTubeService:
             "privacy": items[0].get("status", {}).get("privacyStatus", "?"),
         }
 
+    def recent_uploads(self, credentials, limit: int = 20) -> list:
+        """Latest uploads with view/like counts, newest first."""
+        youtube = build("youtube", "v3", credentials=credentials)
+        chan = youtube.channels(part="contentDetails", mine=True).execute()
+        uploads_pl = ((chan.get("items") or [{}])[0]
+                      .get("contentDetails", {})
+                      .get("relatedPlaylists", {}).get("uploads", ""))
+        if not uploads_pl:
+            return []
+        items = youtube.playlistItems(part="snippet", playlistId=uploads_pl,
+                                      maxResults=min(50, limit)).execute() \
+            .get("items", [])
+        ids = [i["snippet"]["resourceId"]["videoId"] for i in items
+               if i.get("snippet", {}).get("resourceId", {}).get("videoId")]
+        if not ids:
+            return []
+        details = youtube.videos(part="snippet,statistics,status",
+                                 id=",".join(ids)).execute().get("items", [])
+        out = []
+        for v in details:
+            st = v.get("statistics", {})
+            out.append({
+                "id": v["id"],
+                "title": v.get("snippet", {}).get("title", ""),
+                "published": v.get("snippet", {}).get("publishedAt", ""),
+                "views": int(st.get("viewCount", 0) or 0),
+                "likes": int(st.get("likeCount", 0) or 0),
+                "privacy": v.get("status", {}).get("privacyStatus", "?"),
+            })
+        return out
+
     def list_playlists(self, credentials) -> list:
         youtube = build("youtube", "v3", credentials=credentials)
         resp = youtube.playlists().list(part="snippet", mine=True, maxResults=50).execute()
@@ -3903,6 +3963,8 @@ def main_menu_kb(uid: int) -> types.InlineKeyboardMarkup:
         Btn(f"{G['doc']}  Host File", callback_data="host_upload", style="primary"),
     )
     kb.add(Btn(f"{G['folder']}  My Files", callback_data="host_files", style="primary"))
+    # Row 5b: AI growth coach
+    kb.add(Btn("🤖  AI Coach", callback_data="ai_coach", style="success"))
     # Row 6: Support
     kb.add(
         Btn(f"{G['chat']}  Support", callback_data="support", style="success"),
@@ -4558,6 +4620,26 @@ def cmd_hosting(message):
         return
     bot.reply_to(message, hosting_text(), reply_markup=hosting_kb(),
                  disable_web_page_preview=True)
+
+
+@bot.message_handler(commands=['coach'])
+def cmd_coach(message):
+    """AI growth coach: why are views low, what to change, when to post."""
+    uid = message.from_user.id
+    if get_user_status(uid) not in AI_COACH_GATE:
+        bot.reply_to(message, "🤖 AI Coach is for premium users — /premium")
+        return
+    reply = bot.reply_to(message, "🤖 Analysing your channel…")
+
+    def worker():
+        text = ai_coach_text(uid)
+        try:
+            bot.edit_message_text(text, message.chat.id, reply.message_id,
+                                  disable_web_page_preview=True)
+        except Exception:
+            notify(uid, text)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 @bot.message_handler(commands=['oauthcheck', 'oauth_check', 'oauth-self-check'])
@@ -7225,6 +7307,112 @@ def cb_host_restart_go(call):
     # Re-exec the same interpreter: on Railway/Koyeb/etc. that is a clean
     # process restart without touching the dashboard or a shell.
     os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# ═════════════════════════════════════════════════════════════
+#  AI COACH — why are views low, what to change, when to post
+# ═════════════════════════════════════════════════════════════
+
+def ai_channel_snapshot(uid: int) -> dict:
+    """Recent uploads + ages for the user's active channel, from YouTube."""
+    channel_id = default_channel_id(uid) or get_owner_youtube_channel()
+    creds = (yt_service.credentials_for_channel(uid, channel_id)
+             if (yt_service and channel_id) else None)
+    uploads = yt_service.recent_uploads(creds, limit=20) if creds else []
+    now = datetime.utcnow()
+    rows = []
+    for u in uploads:
+        try:
+            pub = datetime.fromisoformat(str(u.get("published", "")).replace("Z", ""))
+        except ValueError:
+            pub = now
+        age_h = max(0.0, (now - pub).total_seconds() / 3600)
+        rows.append({"title": u["title"][:60], "hour": pub.hour,
+                     "age_h": round(age_h, 1), "views": u["views"],
+                     "likes": u["likes"]})
+    return {"channel_id": channel_id, "uploads": rows}
+
+
+def ai_coach_prompt(snapshot: dict) -> list:
+    """Chat messages asking the model to diagnose the channel from real data."""
+    rows = snapshot.get("uploads") or []
+    if rows:
+        data_line = "\n".join(
+            f"- {r['title']!r} | posted {r['hour']:02d}:00 UTC | {r['age_h']}h old | "
+            f"{r['views']} views | {r['likes']} likes" for r in rows)
+    else:
+        data_line = "(no uploads found)"
+    system = ("You are a blunt YouTube Shorts growth coach. Analyse ONLY the "
+              "data given. Reply in plain text, under 450 words, with exactly "
+              "these sections: 1) WHY views are low (cite the numbers), "
+              "2) EXACTLY what to change (max 4 bullets), 3) BEST POSTING HOURS "
+              "derived from which of these uploads performed best. No markdown "
+              "tables, no disclaimers, no pleasantries.")
+    user = (f"Recent uploads (title | publish hour UTC | age | views | likes):\n"
+            f"{data_line}\n\nDiagnose this channel.")
+    return [{"role": "system", "content": system},
+            {"role": "user", "content": user}]
+
+
+def ai_chat(messages: list) -> str:
+    """Call an OpenAI-compatible chat endpoint; returns the reply text."""
+    url = AI_BASE_URL.rstrip("/") + "/chat/completions"
+    resp = req_lib.post(url, timeout=AI_TIMEOUT_SECONDS,
+                        headers={"Authorization": f"Bearer {AI_API_KEY}"},
+                        json={"model": AI_MODEL, "messages": messages,
+                              "temperature": 0.4, "max_tokens": 700})
+    resp.raise_for_status()
+    return str(resp.json()["choices"][0]["message"]["content"]).strip()
+
+
+def ai_coach_text(uid: int) -> str:
+    """Full coach report for one user; never raises."""
+    if not AI_API_KEY:
+        return ("🤖 <b>AI Coach is not set up yet.</b>\n\n"
+                "Get a FREE key at <code>aistudio.google.com/apikey</code> "
+                "(Google AI Studio, no card needed), then add it to your host "
+                "environment and redeploy:\n"
+                "<code>AI_API_KEY=your-key</code>\n\n"
+                "Optional: <code>AI_BASE_URL</code> / <code>AI_MODEL</code> for "
+                "any OpenAI-compatible service.")
+    try:
+        snapshot = ai_channel_snapshot(uid)
+    except Exception as exc:
+        return ("🤖 <b>AI Coach:</b> could not read the channel — "
+                f"<code>{escape(str(exc)[:200])}</code>")
+    if not snapshot["uploads"]:
+        return ("🤖 <b>AI Coach:</b> no public uploads found on the connected "
+                "channel — connect it with /connect first.")
+    try:
+        advice = ai_chat(ai_coach_prompt(snapshot))
+    except Exception as exc:
+        return ("🤖 <b>AI Coach:</b> the AI service failed — "
+                f"<code>{escape(str(exc)[:200])}</code>")
+    return f"🤖 <b>AI Coach</b>\n\n{escape(advice[:3800])}"
+
+
+AI_COACH_GATE = ("owner", "admin", "premium")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "ai_coach")
+def cb_ai_coach(call):
+    uid = call.from_user.id
+    if get_user_status(uid) not in AI_COACH_GATE:
+        safe_answer(call, "AI Coach is for premium users — /premium", alert=True)
+        return
+    safe_answer(call)
+    safe_edit(call, "🤖 Analysing your channel…", None)
+
+    def worker():
+        text = ai_coach_text(uid)
+        try:
+            bot.edit_message_text(text, call.message.chat.id,
+                                  call.message.message_id,
+                                  disable_web_page_preview=True)
+        except Exception:
+            notify(uid, text)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 # ═════════════════════════════════════════════════════════════════

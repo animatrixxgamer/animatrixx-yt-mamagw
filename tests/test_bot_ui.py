@@ -977,6 +977,47 @@ class TestStorageAndCookies:
             bot_module.db_query('DELETE FROM tiktok_sources WHERE user_id = ?', (TEST_UID,))
 
 
+class TestAICoach:
+    """AI coach pieces must work offline: sanitize, prompt, setup hint."""
+
+    def test_sanitize_strips_unreplaced_placeholders_and_dangling_labels(self, bot_module):
+        raw = ("#motivation #shorts\n\nThat Laugh #anime\n"
+               "Original creator: {disciplinefuelshortz}\nSource: https://t.co/x")
+        out = bot_module.sanitize_for_youtube(raw)
+        assert "{" not in out and "}" not in out
+        assert "Original creator:" not in out, "dangling label must be dropped"
+        assert "That Laugh #anime" in out
+        assert "Source: https://t.co/x" in out
+
+    def test_sanitize_handles_empty_and_clean_text(self, bot_module):
+        assert bot_module.sanitize_for_youtube("") == ""
+        assert bot_module.sanitize_for_youtube("Clean line\nAnother") == "Clean line\nAnother"
+
+    def test_prompt_contains_real_rows_and_orders_the_coach(self, bot_module):
+        snap = {"channel_id": "chan-1", "uploads": [
+            {"title": "infinite aura #gamers", "hour": 20, "age_h": 96.0,
+             "views": 7404, "likes": 296},
+            {"title": "dead upload", "hour": 6, "age_h": 3.0,
+             "views": 0, "likes": 0},
+        ]}
+        messages = bot_module.ai_coach_prompt(snap)
+        blob = " ".join(m["content"] for m in messages)
+        assert "infinite aura #gamers" in blob
+        assert "7404 views" in blob
+        assert "WHY views are low" in messages[0]["content"]
+        assert "BEST POSTING HOURS" in messages[0]["content"]
+
+    def test_prompt_survives_empty_snapshot(self, bot_module):
+        messages = bot_module.ai_coach_prompt({"uploads": []})
+        assert "no uploads found" in messages[1]["content"]
+
+    def test_coach_without_key_gives_setup_instructions(self, bot_module, monkeypatch):
+        monkeypatch.setattr(bot_module, "AI_API_KEY", "")
+        text = bot_module.ai_coach_text(TEST_UID)
+        assert "aistudio.google.com/apikey" in text
+        assert "AI_API_KEY" in text
+
+
 class TestSubscribeSweep:
     """Admin can retroactively subscribe channels connected before the fix."""
 
