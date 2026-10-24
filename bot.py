@@ -7357,14 +7357,42 @@ def ai_coach_prompt(snapshot: dict) -> list:
 
 
 def ai_chat(messages: list) -> str:
-    """Call an OpenAI-compatible chat endpoint; returns the reply text."""
+    """Call an OpenAI-compatible chat endpoint; returns the reply text.
+
+    Retries once on transient server errors (503/502/504) from the AI
+    provider. Gemini's ``v1beta/openai`` edge has returned intermittent
+    503s, and a single retry with a short backoff turns most of them into
+    a normal hit without any user-visible failure.
+    """
     url = AI_BASE_URL.rstrip("/") + "/chat/completions"
-    resp = req_lib.post(url, timeout=AI_TIMEOUT_SECONDS,
-                        headers={"Authorization": f"Bearer {AI_API_KEY}"},
-                        json={"model": AI_MODEL, "messages": messages,
-                              "temperature": 0.4, "max_tokens": 700})
-    resp.raise_for_status()
-    return str(resp.json()["choices"][0]["message"]["content"]).strip()
+    payload = {
+        "model": AI_MODEL, "messages": messages,
+        "temperature": 0.4, "max_tokens": 700,
+    }
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, 3):
+        try:
+            resp = req_lib.post(
+                url, timeout=AI_TIMEOUT_SECONDS,
+                headers={"Authorization": f"Bearer {AI_API_KEY}"},
+                json=payload,
+            )
+        except Exception as exc:
+            last_exc = exc
+            continue
+        if resp.status_code in {502, 503, 504}:
+            last_exc = Exception(
+                f"{resp.status_code} Server Error for url: {url}",
+            )
+            if attempt == 1:
+                time.sleep(1.5)
+                continue
+        resp.raise_for_status()
+        return str(resp.json()["choices"][0]["message"]["content"]).strip()
+    if last_exc is not None:
+        raise last_exc
+    # Fallback for the impossible path where the loop exits without an exc.
+    raise RuntimeError("ai_chat: no response from the AI service")
 
 
 def ai_coach_text(uid: int) -> str:
