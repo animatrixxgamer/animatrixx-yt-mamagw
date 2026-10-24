@@ -4626,15 +4626,26 @@ def cmd_hosting(message):
 
 @bot.message_handler(commands=['coach'])
 def cmd_coach(message):
-    """AI growth coach: why are views low, what to change, when to post."""
+    """AI growth coach: why are views low, what to change, when to post.
+
+    ``/coach`` with no args runs the full diagnosis.
+    ``/coach &lt;question&gt;`` asks the AI a single question about your
+    channel using the same recent-upload data.
+    """
     uid = message.from_user.id
     if get_user_status(uid) not in AI_COACH_GATE:
         bot.reply_to(message, "🤖 AI Coach is for premium users — /premium")
         return
-    reply = bot.reply_to(message, "🤖 Analysing your channel…")
+    body = message.text.split(None, 1)
+    question = body[1] if len(body) > 1 else ""
+    reply = bot.reply_to(
+        message,
+        "🤖 Analysing your channel…"
+        + ("\n(answering your question…)" if question else ""),
+    )
 
     def worker():
-        text = ai_coach_text(uid)
+        text = ai_coach_text(uid, followup=question)
         try:
             bot.edit_message_text(text, message.chat.id, reply.message_id,
                                   disable_web_page_preview=True)
@@ -7335,8 +7346,12 @@ def ai_channel_snapshot(uid: int) -> dict:
     return {"channel_id": channel_id, "uploads": rows}
 
 
-def ai_coach_prompt(snapshot: dict) -> list:
-    """Chat messages asking the model to diagnose the channel from real data."""
+def ai_coach_prompt(snapshot: dict, *, followup: str = "") -> list:
+    """Chat messages asking the model to diagnose the channel from real data.
+
+    When ``followup`` is set the model is asked a follow-up question about the
+    same channel data instead of running the default full diagnosis.
+    """
     rows = snapshot.get("uploads") or []
     if rows:
         data_line = "\n".join(
@@ -7344,6 +7359,21 @@ def ai_coach_prompt(snapshot: dict) -> list:
             f"{r['views']} views | {r['likes']} likes" for r in rows)
     else:
         data_line = "(no uploads found)"
+    if followup:
+        system = (
+            "You are a blunt YouTube Shorts growth coach. Answer ONLY using "
+            "the channel data below and your general YouTube Shorts knowledge. "
+            "Reply in plain text, under 450 words, no markdown tables, no "
+            "disclaimers, no pleasantries."
+        )
+        user = (
+            f"Recent uploads (title | publish hour UTC | age | views | likes):\n"
+            f"{data_line}\n\n"
+            f"User question: {followup}\n\n"
+            "Answer the question directly, using the numbers above where they help."
+        )
+        return [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
     system = ("You are a blunt YouTube Shorts growth coach. Analyse ONLY the "
               "data given. Reply in plain text, under 450 words, with exactly "
               "these sections: 1) WHY views are low (cite the numbers), "
@@ -7395,8 +7425,12 @@ def ai_chat(messages: list) -> str:
     raise RuntimeError("ai_chat: no response from the AI service")
 
 
-def ai_coach_text(uid: int) -> str:
-    """Full coach report for one user; never raises."""
+def ai_coach_text(uid: int, *, followup: str = "") -> str:
+    """Full coach report for one user; never raises.
+
+    With ``followup`` set the bot answers a single question about the
+    channel instead of the default full diagnosis.
+    """
     if not AI_API_KEY:
         return ("🤖 <b>AI Coach is not set up yet.</b>\n\n"
                 "Get a FREE key at <code>aistudio.google.com/apikey</code> "
@@ -7414,11 +7448,12 @@ def ai_coach_text(uid: int) -> str:
         return ("🤖 <b>AI Coach:</b> no public uploads found on the connected "
                 "channel — connect it with /connect first.")
     try:
-        advice = ai_chat(ai_coach_prompt(snapshot))
+        advice = ai_chat(ai_coach_prompt(snapshot, followup=followup))
     except Exception as exc:
         return ("🤖 <b>AI Coach:</b> the AI service failed — "
                 f"<code>{escape(str(exc)[:200])}</code>")
-    return f"🤖 <b>AI Coach</b>\n\n{escape(advice[:3800])}"
+    head = "🤖 <b>AI Coach</b>" + (" — follow-up" if followup else "\n\n") + "\n\n"
+    return head + escape(advice[:3800])
 
 
 AI_COACH_GATE = ("owner", "admin", "premium")
