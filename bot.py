@@ -2669,21 +2669,23 @@ class YouTubeService:
     def recent_uploads(self, credentials, limit: int = 20) -> list:
         """Latest uploads with view/like counts, newest first."""
         youtube = build("youtube", "v3", credentials=credentials)
-        chan = youtube.channels(part="contentDetails", mine=True).execute()
+        chan = youtube.channels().list(
+            part="contentDetails", mine=True).execute()
         uploads_pl = ((chan.get("items") or [{}])[0]
                       .get("contentDetails", {})
                       .get("relatedPlaylists", {}).get("uploads", ""))
         if not uploads_pl:
             return []
-        items = youtube.playlistItems(part="snippet", playlistId=uploads_pl,
-                                      maxResults=min(50, limit)).execute() \
-            .get("items", [])
+        items = youtube.playlistItems().list(
+            part="snippet", playlistId=uploads_pl,
+            maxResults=min(50, limit)).execute().get("items", [])
         ids = [i["snippet"]["resourceId"]["videoId"] for i in items
                if i.get("snippet", {}).get("resourceId", {}).get("videoId")]
         if not ids:
             return []
-        details = youtube.videos(part="snippet,statistics,status",
-                                 id=",".join(ids)).execute().get("items", [])
+        details = youtube.videos().list(
+            part="snippet,statistics,status",
+            id=",".join(ids)).execute().get("items", [])
         out = []
         for v in details:
             st = v.get("statistics", {})
