@@ -850,6 +850,22 @@ def db_query(query, params=(), fetch=False):
         return result
 
 
+def row_to_dict(query: str, params=()) -> dict:
+    """Fetch a single row as a name -> value dict.
+
+    Positional zipping of a row against a hand-written column list silently
+    breaks whenever the table gains a column (SQLite appends new columns at
+    the end, so every index after the insertion point shifts). Keying by the
+    cursor's real column names makes that class of bug impossible.
+    """
+    with DB_LOCK:
+        conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(query, params).fetchone()
+        conn.close()
+    return dict(row) if row else {}
+
+
 def db_insert(query, params=()) -> int:
     """Run an INSERT and return the new row id."""
     with DB_LOCK:
@@ -979,11 +995,16 @@ def source_credit_source(src: Optional[tuple]) -> int:
     0/1 on the row overrides it. Rows from pre-migration databases (missing the
     column) also fall back to the user default.
     """
-    if src is None:
+    if not src:
         return 1
-    value = src[14] if len(src) > 14 else None
+    if isinstance(src, dict):
+        value = src.get("credit_source")
+        uid = src.get("user_id")
+    else:
+        value = src[14] if len(src) > 14 else None
+        uid = src[1]
     if value is None:
-        return user_credit_source(int(src[1]))
+        return user_credit_source(int(uid))
     return 1 if value else 0
 
 
@@ -3550,14 +3571,10 @@ def source_error_is_new(cells: dict, message: str, now: datetime) -> bool:
 
 def poll_source(source_id: int, announce: bool = True) -> int:
     """Check one source and queue any new TikTok videos. Returns job count."""
-    raw = get_source(int(source_id))
-    if raw is None:
+    cells = row_to_dict('SELECT * FROM tiktok_sources WHERE source_id = ?',
+                         (int(source_id),))
+    if not cells:
         return 0
-    cells = dict(zip(
-        ["source_id", "user_id", "handle", "profile_url", "channel_id", "privacy_status",
-         "enabled", "interval_seconds", "max_per_run", "stagger_minutes", "title_template",
-         "last_check", "last_status", "created_at", "credit_source",
-         "last_error_key", "last_error_at"], raw))
     uid = int(cells["user_id"])
     handle = cells["handle"] or ""
     channel_id = cells["channel_id"]
@@ -3618,7 +3635,7 @@ def poll_source(source_id: int, announce: bool = True) -> int:
         if auto_tag:
             tk_tags = f"{tk_tags},{auto_tag}"
         tk_desc = build_import_description(uid, title, handle, url, mark_source=True,
-                                           credit=source_credit_source(raw))
+                                           credit=source_credit_source(cells))
         if defaults.get("tags"):
             tk_tags = defaults["tags"] + "," + tk_tags
         if defaults.get("description"):

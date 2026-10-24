@@ -164,6 +164,38 @@ def test_poll_source_announces_error_once_then_recovery(bot, monkeypatch, sent):
         bot.db_query('DELETE FROM tiktok_sources WHERE source_id = ?', (src_id,))
 
 
+def test_dedup_survives_extra_columns_in_the_table(bot, monkeypatch, sent):
+    """Error dedup must not depend on the table's column count/order.
+
+    Regression: a migration once left an extra column on tiktok_sources, so a
+    positional zip() of the row against a fixed column list shifted every
+    field after credit_source. last_error_key was read as None, the dedup
+    thought every poll was the FIRST failure, and the owner got a "TikTok
+    check failed" message every 15 minutes forever — even though the check
+    itself (and everything else) worked fine.
+    """
+    bot.ensure_user(UID, "pytest-limits")
+    src_id = bot.add_source(UID, "extracol", "https://www.tiktok.com/@extracol",
+                            "chan-1")
+    bot.db_query('UPDATE tiktok_sources SET credit_source = NULL WHERE source_id = ?',
+                 (src_id,))
+    try:
+        def boom(*_a, **_k):
+            raise RuntimeError("TikTok blocked this IP")
+
+        monkeypatch.setattr(bot, "list_profile_videos", boom)
+        assert bot.poll_source(src_id) == 0
+        assert len(sent) == 1, "first failure announces once"
+
+        # Same error again: silent. This is the assertion that failed when the
+        # dedup read the wrong column.
+        assert bot.poll_source(src_id) == 0
+        assert len(sent) == 1
+    finally:
+        bot.db_query('DELETE FROM tiktok_seen WHERE source_id = ?', (src_id,))
+        bot.db_query('DELETE FROM tiktok_sources WHERE source_id = ?', (src_id,))
+
+
 def test_check_now_button_reports_a_failed_check(bot, monkeypatch):
     """The manual Check now button must surface a failed check, not 'nothing new'."""
     bot.ensure_user(UID, "pytest-limits")
